@@ -1,0 +1,143 @@
+# What a client sends to prove it knows the password, for each
+# authentication plugin this driver speaks.
+#
+# crystal-mysql spoke `mysql_native_password` alone, and a server whose
+# user had another plugin - MySQL 8.0's default `caching_sha2_password` -
+# refused it ("Client does not support authentication protocol requested
+# by server"). Here the session answers the server's AuthSwitchRequest and
+# speaks:
+#
+# * `mysql_native_password`: SHA1(password) XOR SHA1(nonce + SHA1(SHA1(password))).
+# * `caching_sha2_password`: SHA256(password) XOR SHA256(SHA256(SHA256(password)) + nonce);
+#   when the server has no cached entry for the user it asks for the
+#   password whole, sent as it is over TLS or a Unix socket, and otherwise
+#   encrypted under the server's RSA public key.
+# * `sha256_password`: the password as it is over TLS or a Unix socket,
+#   encrypted under the server's RSA public key otherwise.
+#
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_authentication_methods.html
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_caching_sha2_authentication_exchanges.html
+module mysql/auth
+
+import std/text
+import std/digest::{SHA1, SHA256}
+import std/big::{BigInt}
+import std/rsa::{RsaPublicKey, RsaError}
+import std/base64::{Base64}
+import std/random::{Random}
+import std/slice::{Slice, Bytes}
+import mysql/errors::{ConnectionError}
+
+pub NATIVE_PASSWORD       = "mysql_native_password"
+pub CACHING_SHA2_PASSWORD = "caching_sha2_password"
+pub SHA256_PASSWORD       = "sha256_password"
+
+# The plugins this driver answers a server with.
+pub SUPPORTED_PLUGINS = [NATIVE_PASSWORD, CACHING_SHA2_PASSWORD, SHA256_PASSWORD]
+
+# What the client sends *plugin* first, *nonce* the server's 20 bytes and
+# *secure* whether the transport may carry the password in the clear; nil
+# for a plugin this driver does not speak.
+pub def scramble(plugin : String, password : String?, nonce : Array(UInt8), secure : Bool) : Array(UInt8)?
+  case plugin
+  when NATIVE_PASSWORD
+    native_password(password, nonce)
+  when CACHING_SHA2_PASSWORD
+    caching_sha2_password(password, nonce)
+  when SHA256_PASSWORD
+    # an empty password is the NUL alone; another goes in the clear over a
+    # secure transport, and otherwise asks the server for its public key
+    return [0_u8] if password.nil? || password.empty?
+    secure ? secure_password(password) : [1_u8]
+  else
+    nil
+  end
+end
+
+# `mysql_native_password`'s answer: empty for no password.
+pub def native_password(password : String?, nonce : Array(UInt8)) : Array(UInt8)
+  return [] of UInt8 if password.nil? || password.empty?
+  sha1 = SHA1.hash_bytes(password)
+  sha1sha1 = SHA1.hash_bytes(sha1)
+  mixed = SHA1.hash_bytes(nonce[0, 20] + sha1sha1)
+  Array(UInt8).new(20) { |i| sha1[i] ^ mixed[i] }
+end
+
+# `caching_sha2_password`'s fast answer: empty for no password.
+pub def caching_sha2_password(password : String?, nonce : Array(UInt8)) : Array(UInt8)
+  return [] of UInt8 if password.nil? || password.empty?
+  p1 = SHA256.hash_bytes(password)
+  p2 = SHA256.hash_bytes(p1)
+  p3 = SHA256.hash_bytes(p2 + nonce[0, 20])
+  Array(UInt8).new(32) { |i| p1[i] ^ p3[i] }
+end
+
+# The password as a secure transport carries it: its bytes and a NUL.
+pub def secure_password(password : String?) : Array(UInt8)
+  (password || "").bytes + [0_u8]
+end
+
+# The password and a NUL, XORed with the nonce (repeated) and encrypted
+# under the server's RSA public key *pem* with RSAES-OAEP (SHA-1, MGF1
+# with SHA-1, no label), as the server decrypts it with
+# `RSA_PKCS1_OAEP_PADDING`.
+pub def rsa_encrypt_password(pem : String, password : String?, nonce : Array(UInt8)) : Array(UInt8) | ConnectionError
+  key = public_key(pem)!
+  plain = secure_password(password)
+  scrambled = Array(UInt8).new(plain.size) { |i| plain[i] ^ nonce[i % nonce.size] }
+  oaep_encrypt(key, scrambled)
+end
+
+# The RSA key of a PEM `PUBLIC KEY` (a SubjectPublicKeyInfo).
+pub def public_key(pem : String) : RsaPublicKey | ConnectionError
+  body = [] of String
+  inside = false
+  pem.each_line do |line|
+    text = line.strip
+    if text.starts_with?("-----BEGIN")
+      inside = true
+    elsif text.starts_with?("-----END")
+      inside = false
+    elsif inside
+      body << text
+    end
+  end
+  return ConnectionError.new("the server's public key is not PEM") if body.empty?
+  der = Base64.decode(body.join).bytes
+  key = RsaPublicKey.from_spki(der)
+  return ConnectionError.new("the server's public key cannot be read: #{key.message}") if key.is_a?(RsaError)
+  key
+end
+
+# RSAES-OAEP-ENCRYPT (RFC 8017 section 7.1.1) with SHA-1 and an empty
+# label.
+pub def oaep_encrypt(key : RsaPublicKey, message : Array(UInt8)) : Array(UInt8) | ConnectionError
+  k = key.size
+  h = 20
+  if message.size > k - 2 * h - 2
+    return ConnectionError.new("the password is too long for the server's #{key.bits}-bit RSA key")
+  end
+  l_hash = SHA1.hash_bytes("")
+  db = l_hash + Array(UInt8).new(k - message.size - 2 * h - 2, 0_u8) + [1_u8] + message
+  seed = Random::Secure.random_bytes(h)
+  db_mask = mgf1(seed, k - h - 1)
+  masked_db = Array(UInt8).new(db.size) { |i| db[i] ^ db_mask[i] }
+  seed_mask = mgf1(masked_db, h)
+  masked_seed = Array(UInt8).new(h) { |i| seed[i] ^ seed_mask[i] }
+  em = [0_u8] + masked_seed + masked_db
+  c = BigInt.from_bytes(em).pow_mod(key.exponent, key.modulus)
+  c.to_bytes(k) || ConnectionError.new("RSA encryption did not fit the key")
+end
+
+# MGF1 over SHA-1 (RFC 8017 appendix B.2.1): *size* bytes.
+def mgf1(seed : Array(UInt8), size : Int32) : Array(UInt8)
+  mask = [] of UInt8
+  counter = 0_u32
+  while mask.size < size
+    block = seed + [(counter >> 24).to_u8, ((counter >> 16) & 0xFF_u32).to_u8,
+                    ((counter >> 8) & 0xFF_u32).to_u8, (counter & 0xFF_u32).to_u8]
+    mask.concat(SHA1.hash_bytes(block))
+    counter = counter + 1
+  end
+  mask[0, size]
+end
