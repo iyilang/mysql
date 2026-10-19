@@ -1,0 +1,147 @@
+# What a `mysql://` URI says about the session: where to connect, as whom,
+# to which database, in which collation, and over TLS or not.
+# crystal-mysql's `MySql::Connection::Options`, `SSLOptions` and `SSLMode`.
+#
+#     mysql://[user[:[password]]@]host[:port][/schema][?param1=value1&param2=value2]
+#     mysql://[user[:[password]]@]/path/to/socket[?param1=value1&...]
+#
+# Parsing answers `ArgumentError` for what it cannot take, where
+# crystal-mysql raised: an `ssl-mode` that is not one, and a collation in
+# `encoding` that is not in `COLLATIONS_IDS_BY_NAME` (crystal-mysql sent id
+# 0 for it).
+module mysql/options
+
+import std/text
+import std/path::{Path}
+import std/uri::{URI, Params}
+import db/db/errors::{DBError, ArgumentError}
+import mysql/collations::{default_collation, id_for_collation}
+
+# How a session is encrypted.
+#
+# * `Disabled`: never.
+# * `Preferred` (the default): over TCP, when the server takes TLS and its
+#   certificate is trusted; unencrypted otherwise. Over a Unix socket never.
+# * `Required`: always, the server's certificate checked.
+# * `VerifyCA`, `VerifyIdentity`: always, the certificate checked against
+#   `ssl-ca`.
+#
+# std/tls checks every certificate - its chain to a root and the host name
+# - whatever the mode, and cannot be told not to: see `mysql/ssl`.
+pub enum SSLMode
+  Disabled
+  Preferred
+  Required
+  VerifyCA
+  VerifyIdentity
+
+  # The mode named *text*, in any case, with or without `-` or `_` between
+  # its words: `preferred`, `VERIFY_CA`, `verify-identity`; nil for none.
+  def self.parse_mode?(text : String) : SSLMode?
+    case text.downcase.delete('-').delete('_')
+    when "disabled"       then SSLMode::Disabled
+    when "preferred"      then SSLMode::Preferred
+    when "required"       then SSLMode::Required
+    when "verifyca"       then SSLMode::VerifyCA
+    when "verifyidentity" then SSLMode::VerifyIdentity
+    else
+      nil
+    end
+  end
+end
+
+# The TLS parameters of a URI: `ssl-mode`, `ssl-key`, `ssl-cert` and
+# `ssl-ca`, the paths expanded (`~` to the home directory).
+pub struct SSLOptions
+  getter mode : SSLMode
+  getter key : Path?
+  getter cert : Path?
+  getter ca : Path?
+
+  def initialize(@mode : SSLMode, @key : Path? = nil, @cert : Path? = nil, @ca : Path? = nil)
+  end
+
+  def self.from_params(params : Params) : SSLOptions | DBError
+    mode = SSLMode::Preferred
+    if mode_param = params["ssl-mode"]?
+      parsed = SSLMode.parse_mode?(mode_param)
+      if parsed.nil?
+        return ArgumentError.new("Unknown ssl-mode #{mode_param.inspect}: disabled, preferred, required, verify_ca or verify_identity")
+      end
+      mode = parsed
+    end
+
+    # NOTE: crystal-mysql expands the paths because OpenSSL did not take
+    # ones prefixed with ~/ or ./; kept, so a path means the same here.
+    key = expand(params["ssl-key"]?)
+    cert = expand(params["ssl-cert"]?)
+    ca = expand(params["ssl-ca"]?)
+
+    SSLOptions.new(mode: mode, key: key, cert: cert, ca: ca)
+  end
+
+  def self.expand(value : String?) : Path?
+    if v = value
+      Path[v].expand(home: true)
+    end
+  end
+end
+
+# Where and as whom to connect. *transport* is `tcp://host:port` or
+# `unix:///path/to/socket`.
+pub struct Options
+  getter transport : URI
+  getter username : String?
+  getter password : String?
+  getter initial_catalog : String?
+  getter charset : String
+  getter ssl_options : SSLOptions
+
+  def initialize(@transport : URI, @username : String?, @password : String?, @initial_catalog : String?, @charset : String, @ssl_options : SSLOptions)
+  end
+
+  def self.from_uri(uri : URI) : Options | DBError
+    params = uri.query_params
+    initial_catalog = params["database"]?
+
+    host = uri.hostname
+    if host && !host.blank?
+      port = uri.port || 3306
+      transport = URI.new("tcp", host, port)
+
+      # for tcp socket we support the first component to be the database
+      # but the query string takes precedence because it's more explicit
+      path = uri.path
+      if initial_catalog.nil? && path.bytesize > 1
+        initial_catalog = path[1..-1]
+      end
+    else
+      transport = URI.new("unix", nil, nil, uri.path)
+    end
+
+    username = uri.user
+    password = uri.password
+
+    charset = params["encoding"]? || default_collation
+    if id_for_collation(charset).nil?
+      return ArgumentError.new("Unknown collation #{charset.inspect} in encoding: see COLLATIONS_IDS_BY_NAME in mysql/collations")
+    end
+
+    Options.new(
+      transport: transport,
+      username: username, password: password,
+      initial_catalog: initial_catalog, charset: charset,
+      ssl_options: SSLOptions.from_params(params)!
+    )
+  end
+
+  # Whether the session goes over a Unix socket.
+  def unix_socket? : Bool
+    @transport.scheme == "unix"
+  end
+
+  # The id of `charset`, the collation the handshake asks for.
+  def charset_id : UInt8
+    (id_for_collation(@charset) || 0).to_u8
+  end
+end
