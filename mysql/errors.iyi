@@ -1,0 +1,48 @@
+# The ways a MySQL session fails, as values (SPEC.md III.1).
+#
+# crystal-mysql raises `MySql::Connection::PacketError`, `IO::Error`s and
+# plain `Exception`s. Here they are `DBError`s, so a `!` hands them through
+# iyi-db unchanged and `in DBError` still catches every one of them.
+module mysql/errors
+
+import db/db/errors::{DBError}
+
+# A connection could not be established or set up: refused, an
+# authentication this driver does not speak, a TLS session the server or
+# the configuration does not allow.
+pub class ConnectionError < DBError
+end
+
+# The socket failed or ended in the middle of a packet, or a packet was not
+# what the protocol says it is. crystal-mysql's `IO::Error` and the
+# `DB::ConnectionLost` its packets raised; a statement answers it as
+# iyi-db's `ConnectionLost`, so the pool retries on another connection.
+pub class StreamError < ConnectionError
+end
+
+# The server answered an ERR packet: its error *code*, the *sql_state*
+# (`"42S02"`, ...) and the message.
+#
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_err_packet.html
+pub class PacketError < DBError
+  getter code : Int32
+  getter sql_state : String
+
+  # The codes that mean the session is gone: 1053 server shutdown in
+  # progress, 1152 aborted connection, 1927 connection killed, 2006 server
+  # has gone away, 2013 lost connection during query. A statement answers
+  # them as iyi-db's `ConnectionLost`, as crystal-mysql raises it.
+  #
+  # https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html
+  # https://dev.mysql.com/doc/mysql-errors/8.0/en/client-error-reference.html
+  LOST_CONNECTION_CODES = [1053, 1152, 1927, 2006, 2013]
+
+  def initialize(message : String, @code : Int32 = 0, @sql_state : String = "")
+    super(message)
+  end
+
+  # Whether the error says the session is gone.
+  def lost_connection? : Bool
+    LOST_CONNECTION_CODES.includes?(@code)
+  end
+end

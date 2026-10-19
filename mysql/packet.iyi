@@ -1,0 +1,361 @@
+# The packets of the MySQL client/server protocol: a three-byte
+# little-endian length, a sequence number, and the payload. crystal-mysql's
+# `MySql::ReadPacket` and `MySql::WritePacket`.
+#
+# A payload of 2^24 - 1 bytes or more goes as several packets, each but the
+# last 2^24 - 1 bytes long, the last shorter (empty when the payload is a
+# multiple): `ReadPacket` reads through them as one, and `WritePacket#frames`
+# cuts a payload into them. crystal-mysql read and wrote one packet only.
+#
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_packets.html
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_dt_integers.html
+module mysql/packet
+
+import std/int
+import std/slice::{Slice, Bytes}
+import mysql/errors::{StreamError}
+import mysql/stream::{ByteSource}
+
+# The longest payload one packet carries.
+pub MAX_PACKET_LENGTH = 0xFFFFFF
+
+# A packet being read from a `ByteSource`. Reads past its payload answer
+# `StreamError`, as the protocol is then out of step.
+pub class ReadPacket
+  # The length of the payload read so far, every packet of it counted.
+  getter length : Int32 = 0
+  # The sequence number of the packet last read: what an answer to it
+  # continues from.
+  getter seq : UInt8 = 0_u8
+  # The bytes left in the packet being read.
+  @remaining = 0
+  # Whether the packet being read is a full one, which another follows.
+  @continued = false
+
+  def initialize(@io : ByteSource)
+  end
+
+  # Reads the header of the next packet from *io*.
+  def self.read(io : ByteSource) : ReadPacket | StreamError
+    packet = ReadPacket.new(io)
+    packet.read_header!
+    packet
+  end
+
+  protected def read_header : Nil | StreamError
+    b0 = @io.read_byte!.to_i32
+    b1 = @io.read_byte!.to_i32
+    b2 = @io.read_byte!.to_i32
+    @seq = @io.read_byte!
+    size = b0 | (b1 << 8) | (b2 << 16)
+    @remaining = size
+    @length += size
+    @continued = size == MAX_PACKET_LENGTH
+    nil
+  end
+
+  # The bytes of the payload not read yet in the packet at hand, reading
+  # the header of the next one when the one at hand is spent and full.
+  private def available : Int32 | StreamError
+    while @remaining == 0 && @continued
+      read_header!
+    end
+    @remaining
+  end
+
+  # Whether the whole payload was read.
+  def at_end? : Bool | StreamError
+    available! == 0
+  end
+
+  def to_s : String
+    "MySql::ReadPacket[length: #{@length}, seq: #{@seq}, remaining: #{@remaining}]"
+  end
+
+  def read_byte : UInt8 | StreamError
+    return StreamError.new("Unexpected end of packet") if available! == 0
+    @remaining -= 1
+    @io.read_byte
+  end
+
+  # Fills *count* bytes at *target*.
+  def read_fully(target : Pointer(UInt8), count : Int32) : Nil | StreamError
+    done = 0
+    while done < count
+      left = available!
+      return StreamError.new("Unexpected end of packet") if left == 0
+      take = count - done
+      take = left if take > left
+      @io.read_fully(target + done, take)!
+      @remaining -= take
+      done += take
+    end
+    nil
+  end
+
+  def read_fully(slice : Bytes) : Nil | StreamError
+    read_fully(slice.to_unsafe, slice.size)
+  end
+
+  # *count* bytes, newly allocated.
+  def read_bytes(count : Int32) : Bytes | StreamError
+    return StreamError.new("Malformed packet: a length of #{count}") if count < 0
+    slice = Bytes.new(count)
+    read_fully(slice)!
+    slice
+  end
+
+  # The bytes of the payload not read yet.
+  def read_rest : Bytes | StreamError
+    bytes = [] of UInt8
+    while (left = available!) > 0
+      chunk = read_bytes(left)!
+      chunk.each { |b| bytes << b }
+    end
+    slice = Bytes.new(bytes.size)
+    bytes.each_with_index { |b, i| slice[i] = b }
+    slice
+  end
+
+  # Skips *count* bytes.
+  def skip(count : Int32) : Nil | StreamError
+    left = count
+    while left > 0
+      here = available!
+      return StreamError.new("Unexpected end of packet") if here == 0
+      take = left < here ? left : here
+      @io.skip(take)!
+      @remaining -= take
+      left -= take
+    end
+    nil
+  end
+
+  # Skips what is left of the payload, so the next packet can be read.
+  def discard : Nil | StreamError
+    while (left = available!) > 0
+      @io.skip(left)!
+      @remaining = 0
+    end
+    nil
+  end
+
+  # A NUL-terminated string; the rest of the payload when it holds no NUL.
+  def read_string : String | StreamError
+    bytes = [] of UInt8
+    while available! > 0
+      b = read_byte!
+      break if b == 0_u8
+      bytes << b
+    end
+    ReadPacket.string(bytes)
+  end
+
+  # A string of *length* bytes.
+  def read_string(length : Int32) : String | StreamError
+    return StreamError.new("Malformed packet: a string of #{length} bytes") if length < 0
+    count = length
+    failed = nil.as(StreamError?)
+    text = String.new(count) do |buffer|
+      result = read_fully(buffer, count)
+      failed = result if result.is_a?(StreamError)
+    end
+    if f = failed
+      return f
+    end
+    text
+  end
+
+  # The rest of the payload as a string.
+  def read_rest_string : String | StreamError
+    bytes = read_rest!
+    String.new(bytes.size) { |buffer| buffer.copy_from(bytes.to_unsafe, bytes.size) }
+  end
+
+  # A string after its length-encoded length.
+  def read_lenenc_string : String | StreamError
+    length = read_lenenc_int!
+    return StreamError.new("Malformed packet: a string of #{length} bytes") if length > 2147483647_u64
+    read_string(length.to_i32)
+  end
+
+  # Bytes after their length-encoded length.
+  def read_blob : Bytes | StreamError
+    length = read_lenenc_int!
+    return StreamError.new("Malformed packet: a blob of #{length} bytes") if length > 2147483647_u64
+    read_bytes(length.to_i32)
+  end
+
+  # A four-byte little-endian integer.
+  def read_int : Int32 | StreamError
+    read_fixed_int(4)!.unsafe_to_i32
+  end
+
+  # An *n*-byte little-endian unsigned integer, *n* at most 8.
+  def read_fixed_int(n : Int32) : UInt64 | StreamError
+    value = 0_u64
+    n.times do |i|
+      value |= read_byte!.to_u64 << (i * 8)
+    end
+    value
+  end
+
+  # A length-encoded integer, its first byte *h* when it was read already.
+  # 0xFB (NULL in a text row) and 0xFF (an ERR packet) are no integer's.
+  def read_lenenc_int(h : UInt8) : UInt64 | StreamError
+    if h < 251_u8
+      h.to_u64
+    elsif h == 0xFC_u8
+      read_fixed_int(2)
+    elsif h == 0xFD_u8
+      read_fixed_int(3)
+    elsif h == 0xFE_u8
+      read_fixed_int(8)
+    else
+      StreamError.new("Unexpected int length")
+    end
+  end
+
+  def read_lenenc_int : UInt64 | StreamError
+    read_lenenc_int(read_byte!)
+  end
+
+  def self.string(bytes : Array(UInt8)) : String
+    String.new(bytes.size) { |buffer| buffer.copy_from(bytes.to_unsafe, bytes.size) }
+  end
+end
+
+# A payload being written, in memory until `frames` cuts it into packets.
+pub class WritePacket
+  @buf : Bytes
+  @len = 0
+
+  def initialize
+    @buf = Bytes.new(256)
+  end
+
+  # How many bytes were written.
+  def bytesize : Int32
+    @len
+  end
+
+  # The payload written so far.
+  def to_slice : Bytes
+    @buf[0, @len]
+  end
+
+  private def reserve(count : Int32) : Nil
+    return if @len + count <= @buf.size
+    size = @buf.size * 2
+    while size < @len + count
+      size *= 2
+    end
+    bigger = Bytes.new(size)
+    bigger.to_unsafe.copy_from(@buf.to_unsafe, @len)
+    @buf = bigger
+  end
+
+  def write_byte(byte : UInt8) : Nil
+    reserve(1)
+    @buf[@len] = byte
+    @len += 1
+  end
+
+  def write(source : Pointer(UInt8), count : Int32) : Nil
+    reserve(count)
+    (@buf.to_unsafe + @len).copy_from(source, count)
+    @len += count
+  end
+
+  def write(slice : Bytes) : Nil
+    write(slice.to_unsafe, slice.size)
+  end
+
+  def write(bytes : Array(UInt8)) : Nil
+    write(bytes.to_unsafe, bytes.size)
+  end
+
+  # The string's bytes, with no length and no NUL.
+  def write_string(s : String) : Nil
+    write(s.to_unsafe, s.bytesize)
+  end
+
+  # The string's bytes and a NUL.
+  def write_nul_string(s : String) : Nil
+    write_string(s)
+    write_byte(0_u8)
+  end
+
+  # The *n* low bytes of *value*, little-endian.
+  def write_fixed_int(value : UInt64, n : Int32) : Nil
+    n.times do |i|
+      write_byte(((value >> (i * 8)) & 0xFF_u64).to_u8)
+    end
+  end
+
+  def write_u16(value : Int32) : Nil
+    write_fixed_int(value.to_u64 & 0xFFFF_u64, 2)
+  end
+
+  def write_u32(value : UInt32) : Nil
+    write_fixed_int(value.to_u64, 4)
+  end
+
+  def write_u64(value : UInt64) : Nil
+    write_fixed_int(value, 8)
+  end
+
+  # *v* as a length-encoded integer.
+  def write_lenenc_int(v : UInt64) : Nil
+    if v < 251_u64
+      write_byte(v.to_u8)
+    elsif v < 65_536_u64
+      write_byte(0xFC_u8)
+      write_fixed_int(v, 2)
+    elsif v < 16_777_216_u64
+      write_byte(0xFD_u8)
+      write_fixed_int(v, 3)
+    else
+      write_byte(0xFE_u8)
+      write_fixed_int(v, 8)
+    end
+  end
+
+  def write_lenenc_int(v : Int) : Nil
+    write_lenenc_int(v.to_u64)
+  end
+
+  def write_lenenc_string(s : String) : Nil
+    write_lenenc_int(s.bytesize.to_u64)
+    write_string(s)
+  end
+
+  def write_blob(v : Bytes) : Nil
+    write_lenenc_int(v.size.to_u64)
+    write(v)
+  end
+
+  # The payload as the packets that carry it, numbered from *seq*: each
+  # a header and up to `MAX_PACKET_LENGTH` bytes, and an empty last one
+  # when the payload fills the one before.
+  def frames(seq : UInt8) : Array(Bytes)
+    frames = [] of Bytes
+    offset = 0
+    number = seq
+    while true
+      size = @len - offset
+      size = MAX_PACKET_LENGTH if size > MAX_PACKET_LENGTH
+      frame = Bytes.new(4 + size)
+      frame[0] = (size & 0xFF).to_u8
+      frame[1] = ((size >> 8) & 0xFF).to_u8
+      frame[2] = ((size >> 16) & 0xFF).to_u8
+      frame[3] = number
+      (frame.to_unsafe + 4).copy_from(@buf.to_unsafe + offset, size)
+      frames << frame
+      offset += size
+      number = (number.to_i32 + 1).unsafe_to_u8
+      break if size < MAX_PACKET_LENGTH
+    end
+    frames
+  end
+end

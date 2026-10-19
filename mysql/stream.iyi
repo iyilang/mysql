@@ -1,0 +1,253 @@
+# Byte sources: the buffered socket stream the protocol reads and writes,
+# and bytes in memory a packet reads the same way. crystal-mysql wrote to
+# and read from its `TCPSocket`, `UNIXSocket` or `OpenSSL::SSL::Socket`;
+# iyi's socket has no buffer of its own, so this is it, over the socket or
+# the TLS session over it.
+#
+# Every read answers `StreamError` when the bytes asked for are not there:
+# the socket failed, or the source ended first.
+module mysql/stream
+
+import std/socket::{IyiSocket, SocketError}
+import std/tls::{TlsClient, TlsError}
+import std/slice::{Slice, Bytes}
+import mysql/errors::{StreamError}
+
+# What a packet reads from: a socket stream or bytes in memory.
+pub abstract class ByteSource
+  abstract def read_byte : UInt8 | StreamError
+
+  # Fills *count* bytes at *target*.
+  abstract def read_fully(target : Pointer(UInt8), count : Int32) : Nil | StreamError
+
+  abstract def skip(count : Int32) : Nil | StreamError
+
+  # Fills *slice* whole.
+  def read_fully(slice : Bytes) : Nil | StreamError
+    read_fully(slice.to_unsafe, slice.size)
+  end
+end
+
+# Bytes in memory, read from the start.
+pub class MemorySource < ByteSource
+  getter bytes : Bytes
+  getter pos : Int32 = 0
+
+  def initialize(@bytes : Bytes)
+  end
+
+  def remaining : Int32
+    @bytes.size - @pos
+  end
+
+  def read_byte : UInt8 | StreamError
+    return StreamError.new("Unexpected end of data") if @pos >= @bytes.size
+    byte = @bytes[@pos]
+    @pos += 1
+    byte
+  end
+
+  def read_fully(target : Pointer(UInt8), count : Int32) : Nil | StreamError
+    return StreamError.new("Unexpected end of data") if count > remaining
+    target.copy_from(@bytes.to_unsafe + @pos, count)
+    @pos += count
+    nil
+  end
+
+  def skip(count : Int32) : Nil | StreamError
+    return StreamError.new("Unexpected end of data") if count > remaining
+    @pos += count
+    nil
+  end
+end
+
+# A buffered stream over a socket, or over a TLS session on it once
+# `start_tls` has been called. Writes collect in memory until `flush`.
+pub class Stream < ByteSource
+  BUFFER_SIZE = 16384
+
+  @socket : IyiSocket
+  @tls : TlsClient? = nil
+  @rbuf : Bytes
+  @rpos = 0
+  @rlen = 0
+  @wbuf : Bytes
+  @wlen = 0
+
+  def initialize(@socket : IyiSocket)
+    @rbuf = Bytes.new(BUFFER_SIZE)
+    @wbuf = Bytes.new(BUFFER_SIZE)
+  end
+
+  def socket : IyiSocket
+    @socket
+  end
+
+  # The TLS session the stream reads and writes through, if there is one.
+  def tls : TlsClient?
+    @tls
+  end
+
+  # Reads and writes through *tls*, a session over this stream's socket,
+  # from here on.
+  def start_tls(tls : TlsClient) : Nil
+    @tls = tls
+  end
+
+  # Whether bytes were read and are not yet taken: after an SSLRequest none
+  # may be, or they came unencrypted and would be taken as the session's.
+  def buffered? : Bool
+    @rpos < @rlen
+  end
+
+  def closed? : Bool
+    if tls = @tls
+      tls.closed? || @socket.closed?
+    else
+      @socket.closed?
+    end
+  end
+
+  # Closes the socket, after TLS's close_notify when there is a session.
+  def close : Nil
+    if tls = @tls
+      tls.close
+    else
+      @socket.close
+    end
+  end
+
+  # ------------------------------------------------------------- reading
+
+  # Reads at least one byte into the buffer; nothing when it holds some.
+  private def fill : Nil | StreamError
+    return nil if @rpos < @rlen
+    return StreamError.new("Socket is closed") if closed?
+    if tls = @tls
+      chunk = tls.read(@rbuf.size)
+      return StreamError.new("TLS error: #{chunk.message}") if chunk.is_a?(TlsError)
+      return StreamError.new("Unexpected end of stream from server") if chunk.empty?
+      @rbuf.to_unsafe.copy_from(chunk.to_unsafe, chunk.bytesize)
+      @rpos = 0
+      @rlen = chunk.bytesize
+      return nil
+    end
+    n = @socket.read(@rbuf.to_unsafe, @rbuf.size)
+    case n
+    when Int32
+      return StreamError.new("Unexpected end of stream from server") if n == 0
+      @rpos = 0
+      @rlen = n
+      nil
+    when SocketError
+      StreamError.new("Socket error: #{n.reason}")
+    else
+      StreamError.new("Socket read was cancelled")
+    end
+  end
+
+  def read_byte : UInt8 | StreamError
+    fill!
+    byte = @rbuf[@rpos]
+    @rpos += 1
+    byte
+  end
+
+  def read_fully(target : Pointer(UInt8), count : Int32) : Nil | StreamError
+    done = 0
+    while done < count
+      if @tls.nil? && @rpos == @rlen && count - done >= @rbuf.size
+        # a big read goes straight to its target
+        return StreamError.new("Socket is closed") if @socket.closed?
+        n = @socket.read(target + done, count - done)
+        case n
+        when Int32
+          return StreamError.new("Unexpected end of stream from server") if n == 0
+          done += n
+        when SocketError
+          return StreamError.new("Socket error: #{n.reason}")
+        else
+          return StreamError.new("Socket read was cancelled")
+        end
+        next
+      end
+      fill!
+      take = @rlen - @rpos
+      take = count - done if take > count - done
+      (target + done).copy_from(@rbuf.to_unsafe + @rpos, take)
+      @rpos += take
+      done += take
+    end
+    nil
+  end
+
+  def skip(count : Int32) : Nil | StreamError
+    left = count
+    while left > 0
+      fill!
+      take = @rlen - @rpos
+      take = left if take > left
+      @rpos += take
+      left -= take
+    end
+    nil
+  end
+
+  # ------------------------------------------------------------- writing
+
+  private def reserve(count : Int32) : Nil
+    return if @wlen + count <= @wbuf.size
+    size = @wbuf.size * 2
+    while size < @wlen + count
+      size *= 2
+    end
+    bigger = Bytes.new(size)
+    bigger.to_unsafe.copy_from(@wbuf.to_unsafe, @wlen)
+    @wbuf = bigger
+  end
+
+  def write_byte(byte : UInt8) : Nil
+    reserve(1)
+    @wbuf[@wlen] = byte
+    @wlen += 1
+  end
+
+  def write(source : Pointer(UInt8), count : Int32) : Nil
+    reserve(count)
+    (@wbuf.to_unsafe + @wlen).copy_from(source, count)
+    @wlen += count
+  end
+
+  def write(slice : Bytes) : Nil
+    write(slice.to_unsafe, slice.size)
+  end
+
+  # Sends what was written. A buffer grown past `BUFFER_SIZE` for a large
+  # packet is let go after its send, not kept for the connection's life.
+  def flush : Nil | StreamError
+    return nil if @wlen == 0
+    return StreamError.new("Socket is closed") if closed?
+    size = @wlen
+    @wlen = 0
+    result = send(@wbuf, size)
+    @wbuf = Bytes.new(BUFFER_SIZE) if @wbuf.size > BUFFER_SIZE
+    result
+  end
+
+  private def send(data : Bytes, size : Int32) : StreamError?
+    if tls = @tls
+      sent = tls.write(String.new(size) { |buffer| buffer.copy_from(data.to_unsafe, size) })
+      return StreamError.new("TLS error: #{sent.message}") if sent.is_a?(TlsError)
+      return nil
+    end
+    n = @socket.write(data.to_unsafe, size)
+    case n
+    when Int32
+      nil
+    when SocketError
+      StreamError.new("Socket error: #{n.reason}")
+    else
+      StreamError.new("Socket write was cancelled")
+    end
+  end
+end
