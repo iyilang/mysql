@@ -1,0 +1,67 @@
+# TLS for a session, over std/tls: the `TlsConfig` its `SSLOptions` ask
+# for. crystal-mysql's `SSLOptions#build_context`.
+#
+# std/tls checks every server's certificate - its chain to a root and the
+# host name - and has no way to turn either off. crystal-mysql checked
+# nothing for `preferred` and `required` (OpenSSL's `VerifyMode::NONE`);
+# here the certificate is checked whatever the mode, against the roots in
+# `ssl-ca`, or the system's when it names none, and `verify_ca` checks the
+# host name as `verify_identity` does. A server whose certificate is
+# self-signed - MySQL's auto-generated one, say - needs its CA in `ssl-ca`,
+# and a certificate naming the host connected to.
+module mysql/ssl
+
+import std/file
+import std/path::{Path}
+import std/tls::{TlsConfig, TlsIdentity, TlsVersion, TlsError}
+import std/x509::{Certificate, X509Error}
+import mysql/options::{SSLOptions}
+import mysql/errors::{ConnectionError}
+
+# What a TLS session under *options* checks and presents: the roots its
+# server's chain must reach (`ssl-ca`, or the system's), the client
+# certificate it sends a server that asks (`ssl-cert` and `ssl-key`), and
+# TLS 1.2 or 1.3, as MySQL 5.7 speaks 1.2 only.
+pub def tls_config(options : SSLOptions) : TlsConfig | ConnectionError
+  config = TlsConfig.new
+  config.min_version = TlsVersion::TLS12
+  config.roots = roots(options)!
+  config.identity = identity(options)!
+  config
+end
+
+# The certificates in `ssl-ca`; nil, the system's, when it is not given.
+pub def roots(options : SSLOptions) : Array(Certificate)? | ConnectionError
+  path = options.ca
+  return nil if path.nil?
+  text = read_file(path, "CA certificate file")!
+  certificates = Certificate.from_pem(text)
+  if certificates.is_a?(X509Error)
+    return ConnectionError.new("could not read CA certificate file #{path.to_s.inspect}: #{certificates.message}")
+  end
+  return ConnectionError.new("CA certificate file #{path.to_s.inspect} holds no certificate") if certificates.empty?
+  certificates
+end
+
+# The certificate and key in `ssl-cert` and `ssl-key`, sent to a server
+# that asks for one; nil when `ssl-cert` is not given.
+pub def identity(options : SSLOptions) : TlsIdentity? | ConnectionError
+  cert_path = options.cert
+  return nil if cert_path.nil?
+  key_path = options.key
+  return ConnectionError.new("ssl-cert is given, but not ssl-key") if key_path.nil?
+  identity = TlsIdentity.from_pem(read_file(cert_path, "certificate file")!, read_file(key_path, "private key file")!)
+  if identity.is_a?(TlsError)
+    return ConnectionError.new("could not load certificate #{cert_path.to_s.inspect} and key #{key_path.to_s.inspect}: #{identity.message}")
+  end
+  identity
+end
+
+# File.read panics on a file it cannot read; this answers why instead.
+def read_file(path : Path, what : String) : String | ConnectionError
+  name = path.to_s
+  unless File.file?(name) && File.readable?(name)
+    return ConnectionError.new("could not read #{what} #{name.inspect}")
+  end
+  File.read(name)
+end
