@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ppassword"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # The oldest iyi this release supports (README, Requirements).
+      IYI_VERSION: 0.18.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install iyi
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/iyilang/iyi/master/install.sh | IYI_PREFIX="$HOME/.iyi" sh
+          echo "$HOME/.iyi/bin" >> "$GITHUB_PATH"
+
+      - run: iyi version
+
+      # Without TLS: db/db/spec runs its examples as tasks, whose 256 KiB
+      # stack a debug build's handshake overruns in iyi 0.18.0
+      # (iyilang/iyi#130), and `ssl-mode=preferred` would try one against
+      # the server's auto-generated certificate.
+      - name: Test
+        env:
+          DATABASE_URL: mysql://root:password@127.0.0.1?ssl-mode=disabled
+        run: iyi test mysql
+
+      - name: Give the server a certificate for 127.0.0.1
+        run: |
+          dir="$RUNNER_TEMP/certs"
+          mkdir -p "$dir"
+          cd "$dir"
+          openssl genrsa -out ca.key 2048
+          openssl req -new -key ca.key -subj "/CN=iyi-mysql test CA" -out ca.csr
+          printf '%s\n' "basicConstraints=critical,CA:TRUE" "keyUsage=critical,keyCertSign,cRLSign" > ca.ext
+          openssl x509 -req -in ca.csr -signkey ca.key -days 2 -out ca.crt -extfile ca.ext
+          # sign NAME SUBJECT EXTENSIONS: a key and a certificate for it from the CA
+          sign() {
+            openssl genrsa -out "$1.key" 2048
+            openssl req -new -key "$1.key" -subj "$2" -out "$1.csr"
+            printf '%b\n' "$3" > "$1.ext"
+            openssl x509 -req -in "$1.csr" -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 -out "$1.crt" -extfile "$1.ext"
+          }
+          sign server "/CN=localhost" "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth"
+          sign client "/CN=iyi_client" "extendedKeyUsage=clientAuth"
+
+          container=${{ job.services.mysql.id }}
+          docker exec "$container" mkdir -p /etc/mysql/certs
+          for file in ca.crt server.crt server.key; do
+            docker cp "$file" "$container:/etc/mysql/certs/$file"
+          done
+          docker exec "$container" chown -R mysql:mysql /etc/mysql/certs
+          docker exec "$container" mysql -uroot -ppassword -e "
+            SET PERSIST ssl_ca = '/etc/mysql/certs/ca.crt';
+            SET PERSIST ssl_cert = '/etc/mysql/certs/server.crt';
+            SET PERSIST ssl_key = '/etc/mysql/certs/server.key';
+            ALTER INSTANCE RELOAD TLS;"
+
+          {
+            echo "SSL_CA=$dir/ca.crt"
+            echo "SSL_CLIENT_CERT=$dir/client.crt"
+            echo "SSL_CLIENT_KEY=$dir/client.key"
+          } >> "$GITHUB_ENV"
+
+      # Over TLS, every test built with --release, whose handshake fits a
+      # task's stack (iyilang/iyi#130).
+      - name: Test over TLS
+        run: |
+          export DATABASE_URL="mysql://root:password@127.0.0.1?ssl-mode=verify_identity&ssl-ca=$SSL_CA"
+          for test in mysql/*_test.iyi; do
+            echo "running $test"
+            iyi build --release "$test" -o "$RUNNER_TEMP/test"
+            "$RUNNER_TEMP/test"
+          done
+
+      - name: Check formatting
+        run: iyi fmt --check mysql.iyi mysql
