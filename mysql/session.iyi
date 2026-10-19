@@ -1,0 +1,523 @@
+# The protocol session under a connection: the socket, the handshake and
+# authentication, and the packets of each command. crystal-mysql kept
+# these in `MySql::Connection` itself; here the connection iyi-db sees
+# (`MySqlConnection`, in `mysql/core`) wraps a `Session`, as iyi-pg's
+# `PGConnection` wraps its `PQConnection`.
+#
+# What a session adds to crystal-mysql's, each for MySQL 8.0, whose
+# defaults crystal-mysql could not connect to:
+#
+# * The server's AuthSwitchRequest is answered, and `caching_sha2_password`
+#   and `sha256_password` are spoken besides `mysql_native_password`
+#   (`mysql/auth`).
+# * `ssl-mode=preferred` goes on unencrypted when the server does not take
+#   TLS or its certificate is not trusted, where crystal-mysql insisted on
+#   TLS and checked no certificate; see `mysql/ssl`.
+# * A Unix socket is never encrypted; crystal-mysql asked for TLS over it
+#   when `ssl-mode` was `required` or stricter. It carries a password in
+#   the clear, as a TLS session does: the server takes it as secure.
+#
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html
+module mysql/session
+
+import std/int
+import std/text
+import std/log::{Log, Logger}
+import std/socket::{IyiSocket, SocketError}
+import std/tls::{TlsClient, TlsConfig, TlsError}
+import std/slice::{Slice, Bytes}
+import db/db/errors::{DBError}
+import mysql/errors::*
+import mysql/stream::{Stream}
+import mysql/packet::{ReadPacket, WritePacket}
+import mysql/options::{Options, SSLMode}
+import mysql/types::{ColumnSpec}
+import mysql/auth::*
+import mysql/ssl::{tls_config}
+
+# The logger the driver writes to; its source is "mysql".
+pub LOG = Log.for("mysql")
+
+# The capability flags of the protocol.
+#
+# https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__capabilities__flags.html
+pub struct Capabilities
+  CLIENT_LONG_PASSWORD                  = 0x00000001_u32
+  CLIENT_FOUND_ROWS                     = 0x00000002_u32
+  CLIENT_LONG_FLAG                      = 0x00000004_u32
+  CLIENT_CONNECT_WITH_DB                = 0x00000008_u32
+  CLIENT_NO_SCHEMA                      = 0x00000010_u32
+  CLIENT_COMPRESS                       = 0x00000020_u32
+  CLIENT_ODBC                           = 0x00000040_u32
+  CLIENT_LOCAL_FILES                    = 0x00000080_u32
+  CLIENT_IGNORE_SPACE                   = 0x00000100_u32
+  CLIENT_PROTOCOL_41                    = 0x00000200_u32
+  CLIENT_INTERACTIVE                    = 0x00000400_u32
+  CLIENT_SSL                            = 0x00000800_u32
+  CLIENT_IGNORE_SIGPIPE                 = 0x00001000_u32
+  CLIENT_TRANSACTIONS                   = 0x00002000_u32
+  CLIENT_RESERVED                       = 0x00004000_u32
+  CLIENT_SECURE_CONNECTION              = 0x00008000_u32
+  CLIENT_MULTI_STATEMENTS               = 0x00010000_u32
+  CLIENT_MULTI_RESULTS                  = 0x00020000_u32
+  CLIENT_PS_MULTI_RESULTS               = 0x00040000_u32
+  CLIENT_PLUGIN_AUTH                    = 0x00080000_u32
+  CLIENT_CONNECT_ATTRS                  = 0x00100000_u32
+  CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 0x00200000_u32
+  CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS   = 0x00400000_u32
+  CLIENT_SESSION_TRACK                  = 0x00800000_u32
+  CLIENT_DEPRECATE_EOF                  = 0x01000000_u32
+end
+
+# The server's greeting: crystal-mysql's `Protocol::HandshakeV10`.
+#
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_v10.html
+pub struct HandshakeV10
+  getter version : String
+  getter connection_id : Int32
+  getter auth_plugin_data : Array(UInt8)
+  getter capabilities : UInt32
+  getter charset : UInt8
+  getter auth_plugin_name : String
+
+  def initialize(@version : String, @connection_id : Int32, @auth_plugin_data : Array(UInt8), @capabilities : UInt32, @charset : UInt8, @auth_plugin_name : String)
+  end
+
+  # The greeting in *packet*, whose first byte, the protocol version, was
+  # read already.
+  def self.read(packet : ReadPacket) : HandshakeV10 | DBError
+    version = packet.read_string!
+    thread = packet.read_int!
+
+    auth_data = packet.read_bytes(8)!.to_a
+    packet.read_byte! # filler
+    caps = packet.read_fixed_int(2)!.to_u32
+    charset = 0_u8
+    plugin = NATIVE_PASSWORD
+    unless packet.at_end?!
+      charset = packet.read_byte!
+      packet.read_fixed_int(2)! # status flags
+      caps |= packet.read_fixed_int(2)!.to_u32 << 16
+      auth_plugin_data_length = packet.read_byte!.to_i32
+      packet.skip(10)! # reserved
+      if (caps & Capabilities::CLIENT_SECURE_CONNECTION) != 0_u32
+        # the rest of the nonce, 12 bytes and a NUL for 20
+        rest = auth_plugin_data_length - 8
+        rest = 13 if rest < 13
+        part = packet.read_bytes(rest)!.to_a
+        part = part[0, part.size - 1] if part.size > 0 && part.last == 0_u8
+        auth_data.concat(part)
+      end
+      if (caps & Capabilities::CLIENT_PLUGIN_AUTH) != 0_u32 && !packet.at_end?!
+        plugin = packet.read_string!
+      end
+    end
+
+    HandshakeV10.new(version, thread, auth_data, caps, charset, plugin)
+  end
+end
+
+# The OK packet's counts.
+pub struct OkPacket
+  getter affected_rows : Int64
+  getter last_insert_id : Int64
+
+  def initialize(@affected_rows : Int64, @last_insert_id : Int64)
+  end
+
+  # The OK packet in *packet*, whose header byte was read already.
+  def self.read(packet : ReadPacket) : OkPacket | DBError
+    affected_rows = packet.read_lenenc_int!
+    last_insert_id = packet.read_lenenc_int!
+    OkPacket.new(affected_rows.unsafe_to_i64, last_insert_id.unsafe_to_i64)
+  end
+end
+
+# What COM_STMT_PREPARE answers: the statement's id and its parameters and
+# columns.
+pub struct PreparedStatementInfo
+  getter statement_id : Int32
+  getter params : Array(ColumnSpec)
+  getter columns : Array(ColumnSpec)
+
+  def initialize(@statement_id : Int32, @params : Array(ColumnSpec), @columns : Array(ColumnSpec))
+  end
+end
+
+pub class Session
+  COM_QUIT         = 0x01_u8
+  COM_QUERY        = 0x03_u8
+  COM_STMT_PREPARE = 0x16_u8
+  COM_STMT_EXECUTE = 0x17_u8
+  COM_STMT_CLOSE   = 0x19_u8
+
+  getter stream : Stream
+  getter options : Options
+  # The version the server's greeting names.
+  getter server_version : String = ""
+  # The server's id for this session, what `CONNECTION_ID()` answers and
+  # `KILL` takes.
+  getter connection_id : Int32 = 0
+  # The packet being read, skipped to its end before the next is read.
+  @packet : ReadPacket? = nil
+
+  def initialize(@stream : Stream, @options : Options)
+  end
+
+  # The session *options* describe, open and authenticated, encrypted as
+  # their `ssl-mode` asks: see `SSLMode`. A Unix socket is never
+  # encrypted.
+  def self.establish(options : Options) : Session | DBError
+    mode = options.ssl_options.mode
+    return unencrypted(options) if options.unix_socket? || mode == SSLMode::Disabled
+    # The configuration first: a CA or client certificate that cannot be
+    # read is the caller's to fix before any server is asked anything.
+    config = tls_config(options.ssl_options)!
+    session = start(options, mode == SSLMode::Preferred ? :try : :must, config)
+    return session unless session.is_a?(TlsError)
+    return ConnectionError.new("TLS handshake failed: #{session.message}") unless mode == SSLMode::Preferred
+    LOG.debug { "TLS handshake failed (#{session.message}): connecting unencrypted" }
+    unencrypted(options)
+  end
+
+  private def self.unencrypted(options : Options) : Session | DBError
+    session = start(options, :off)
+    return ConnectionError.new("TLS handshake failed: #{session.message}") if session.is_a?(TlsError)
+    session
+  end
+
+  # Connects and authenticates, asking for TLS as *ssl* says: `:off` not
+  # at all, `:must` with no session without it, `:try` going on
+  # unencrypted when the server does not take it. A failed handshake is
+  # answered as its `TlsError`, the socket closed.
+  private def self.start(options : Options, ssl : Symbol, config : TlsConfig? = nil) : Session | TlsError | DBError
+    socket = connect_socket(options)!
+    session = Session.new(Stream.new(socket), options)
+    result = session.handshake(ssl, config)
+    unless result.nil?
+      session.close_socket
+      return result
+    end
+    session
+  end
+
+  private def self.connect_socket(options : Options) : IyiSocket | DBError
+    transport = options.transport
+    socket = if options.unix_socket?
+               IyiSocket.connect_unix(transport.path)
+             else
+               host = transport.hostname || ""
+               return ConnectionError.new("Missing host in transport #{transport}") if host.empty?
+               IyiSocket.connect(host, transport.port || 3306)
+             end
+    case socket
+    when IyiSocket
+      socket
+    when SocketError
+      ConnectionError.new("Cannot establish connection: #{socket.reason}")
+    else
+      ConnectionError.new("Cannot establish connection: cancelled")
+    end
+  end
+
+  # Whether a password may go in the clear: over TLS or a Unix socket.
+  def secure? : Bool
+    @options.unix_socket? || !@stream.tls.nil?
+  end
+
+  # Reads the greeting, encrypts the session as *ssl* says, and
+  # authenticates; nil once the server has said OK.
+  protected def handshake(ssl : Symbol, config : TlsConfig?) : Nil | TlsError | DBError
+    packet = read_packet!
+    protocol_version = packet.read_byte!
+    return handle_err_packet(packet) if protocol_version == 0xFF_u8
+    unless protocol_version == 10_u8
+      return ConnectionError.new("Unsupported protocol version #{protocol_version}: this driver speaks 10")
+    end
+    handshake = HandshakeV10.read(packet)!
+    @server_version = handshake.version
+    @connection_id = handshake.connection_id
+
+    seq = 1_u8
+    if ssl != :off && (cfg = config)
+      if (handshake.capabilities & Capabilities::CLIENT_SSL) == 0_u32
+        if ssl == :must
+          return ConnectionError.new("the server does not support TLS, but ssl-mode=#{@options.ssl_options.mode} requires it")
+        end
+      else
+        write_packet(seq, ssl_request)!
+        seq = 2_u8
+        encrypted = start_tls(cfg)
+        return encrypted unless encrypted.nil?
+      end
+    end
+
+    password = @options.password
+    plugin = SUPPORTED_PLUGINS.includes?(handshake.auth_plugin_name) ? handshake.auth_plugin_name : NATIVE_PASSWORD
+    write_packet(seq, handshake_response(plugin, first_answer(plugin, password, handshake.auth_plugin_data)))!
+    authenticate(plugin, password, handshake.auth_plugin_data)
+  end
+
+  # The handshake over TLS on this session's socket, checking the
+  # server's certificate for the host connected to.
+  private def start_tls(config : TlsConfig) : Nil | TlsError | DBError
+    @stream.flush!
+    if @stream.buffered?
+      return ConnectionError.new("the server sent unencrypted data after the SSLRequest")
+    end
+    tls = TlsClient.over(@stream.socket, @options.transport.hostname || "", config)
+    return tls if tls.is_a?(TlsError)
+    @stream.start_tls(tls)
+    nil
+  end
+
+  # The capabilities this client asks for. crystal-mysql's, with
+  # `CLIENT_PLUGIN_AUTH` always, so the server can switch plugins, and
+  # `CLIENT_SSL` once the session is encrypted.
+  private def capabilities : UInt32
+    caps = Capabilities::CLIENT_PROTOCOL_41 | Capabilities::CLIENT_SECURE_CONNECTION |
+           Capabilities::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA | Capabilities::CLIENT_PLUGIN_AUTH
+    caps |= Capabilities::CLIENT_CONNECT_WITH_DB if @options.initial_catalog
+    caps |= Capabilities::CLIENT_SSL unless @stream.tls.nil?
+    caps
+  end
+
+  # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_ssl_request.html
+  private def ssl_request : WritePacket
+    packet = WritePacket.new
+    caps = Capabilities::CLIENT_PROTOCOL_41 | Capabilities::CLIENT_SSL | Capabilities::CLIENT_SECURE_CONNECTION |
+           Capabilities::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA | Capabilities::CLIENT_PLUGIN_AUTH
+    caps |= Capabilities::CLIENT_CONNECT_WITH_DB if @options.initial_catalog
+    packet.write_u32(caps)
+    packet.write_u32(0_u32) # max packet size
+    packet.write_byte(@options.charset_id)
+    23.times { packet.write_byte(0_u8) }
+    packet
+  end
+
+  # crystal-mysql's `Protocol::HandshakeResponse41`, naming *plugin* and
+  # carrying its *auth_response*.
+  #
+  # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html
+  private def handshake_response(plugin : String, auth_response : Array(UInt8)) : WritePacket
+    packet = WritePacket.new
+    packet.write_u32(capabilities)
+    packet.write_u32(0_u32) # max packet size
+    packet.write_byte(@options.charset_id)
+    23.times { packet.write_byte(0_u8) }
+    packet.write_nul_string(@options.username || "")
+    packet.write_lenenc_int(auth_response.size.to_u64)
+    packet.write(auth_response)
+    if initial_catalog = @options.initial_catalog
+      packet.write_nul_string(initial_catalog)
+    end
+    packet.write_nul_string(plugin)
+    packet
+  end
+
+  # What the client sends *plugin* first: callers have checked the plugin
+  # is one this driver speaks.
+  private def first_answer(plugin : String, password : String?, nonce : Array(UInt8)) : Array(UInt8)
+    scramble(plugin, password, nonce, secure?) || [] of UInt8
+  end
+
+  # Reads the server's answers to the handshake response until its OK,
+  # answering an AuthSwitchRequest and the AuthMoreData of
+  # `caching_sha2_password` and `sha256_password`.
+  private def authenticate(plugin : String, password : String?, nonce : Array(UInt8)) : Nil | DBError
+    awaiting_key = plugin == SHA256_PASSWORD && !secure? && !(password.nil? || password.empty?)
+    while true
+      packet = read_packet!
+      status = packet.read_byte!
+      case status
+      when 0x00_u8
+        return nil
+      when 0xFF_u8
+        return handle_err_packet(packet)
+      when 0xFE_u8
+        # AuthSwitchRequest: another plugin, and a nonce for it
+        return ConnectionError.new("the server asked for the old password authentication, which this driver does not speak") if packet.at_end?!
+        plugin = packet.read_string!
+        data = packet.read_rest!.to_a
+        data = data[0, data.size - 1] if data.size > 0 && data.last == 0_u8
+        nonce = data
+        unless SUPPORTED_PLUGINS.includes?(plugin)
+          return ConnectionError.new("the server asked for authentication plugin #{plugin}, which this driver does not speak")
+        end
+        awaiting_key = plugin == SHA256_PASSWORD && !secure? && !(password.nil? || password.empty?)
+        write_packet(next_seq(packet), packet_of(first_answer(plugin, password, nonce)))!
+      when 0x01_u8
+        # AuthMoreData
+        data = packet.read_rest!
+        if awaiting_key
+          pem = String.new(data.size) { |buffer| buffer.copy_from(data.to_unsafe, data.size) }
+          encrypted = rsa_encrypt_password(pem, password, nonce)!
+          write_packet(next_seq(packet), packet_of(encrypted))!
+          awaiting_key = false
+        elsif plugin == CACHING_SHA2_PASSWORD && data.size == 1 && data[0] == 3_u8
+          # fast authentication succeeded; the OK follows
+        elsif plugin == CACHING_SHA2_PASSWORD && data.size == 1 && data[0] == 4_u8
+          # full authentication: the password itself
+          if secure?
+            write_packet(next_seq(packet), packet_of(secure_password(password)))!
+          else
+            write_packet(next_seq(packet), packet_of([2_u8]))! # the server's public key, please
+            awaiting_key = true
+          end
+        else
+          return ConnectionError.new("unexpected authentication data from the server for #{plugin}")
+        end
+      else
+        return ConnectionError.new("unexpected packet #{status} during authentication")
+      end
+    end
+    nil
+  end
+
+  private def next_seq(packet : ReadPacket) : UInt8
+    (packet.seq.to_i32 + 1).unsafe_to_u8
+  end
+
+  private def packet_of(bytes : Array(UInt8)) : WritePacket
+    packet = WritePacket.new
+    packet.write(bytes)
+    packet
+  end
+
+  # ------------------------------------------------------------- packets
+
+  # The next packet, after what is left of the one before is skipped.
+  def read_packet : ReadPacket | StreamError
+    if previous = @packet
+      @packet = nil
+      previous.discard!
+    end
+    packet = ReadPacket.read(@stream)!
+    @packet = packet
+    packet
+  end
+
+  # Sends *packet*'s payload, numbered from *seq*.
+  def write_packet(seq : UInt8, packet : WritePacket) : Nil | StreamError
+    packet.frames(seq).each { |frame| @stream.write(frame) }
+    @stream.flush
+  end
+
+  # Sends the command *command* with *payload* after it, as the first
+  # packet of an exchange.
+  def write_command(command : UInt8, payload : String = "") : Nil | StreamError
+    packet = WritePacket.new
+    packet.write_byte(command)
+    packet.write_string(payload)
+    write_packet(0_u8, packet)
+  end
+
+  # The ERR packet in *packet*, whose 0xFF was read already: the code, the
+  # SQL state after its `#`, and the message.
+  #
+  # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_err_packet.html
+  def handle_err_packet(packet : ReadPacket) : DBError
+    code = packet.read_fixed_int(2)
+    return code if code.is_a?(DBError)
+    sql_state = ""
+    unless packet.at_end? == true
+      marker = packet.read_byte
+      return marker if marker.is_a?(DBError)
+      if marker == 35_u8 # '#'
+        state = packet.read_string(5)
+        return state if state.is_a?(DBError)
+        sql_state = state
+        message = packet.read_rest_string
+      else
+        rest = packet.read_rest_string
+        message = rest.is_a?(DBError) ? rest : marker.unsafe_chr.to_s + rest
+      end
+      return message if message.is_a?(DBError)
+      return PacketError.new(message, code.to_i32, sql_state)
+    end
+    PacketError.new("", code.to_i32, sql_state)
+  end
+
+  # Reads *count* column definitions and, when there are any, the EOF
+  # packet after them.
+  #
+  # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset_column_definition.html
+  def read_column_definitions(count : Int32) : Array(ColumnSpec) | DBError
+    columns = [] of ColumnSpec
+    count.times do
+      packet = read_packet!
+      catalog = packet.read_lenenc_string!
+      schema = packet.read_lenenc_string!
+      table = packet.read_lenenc_string!
+      org_table = packet.read_lenenc_string!
+      name = packet.read_lenenc_string!
+      org_name = packet.read_lenenc_string!
+      next_length = packet.read_lenenc_int! # length of fixed-length fields, always 0x0c
+      return StreamError.new("Unexpected next_length value: #{next_length}.") unless next_length == 0x0c_u64
+      character_set = packet.read_fixed_int(2)!.to_u16
+      column_length = packet.read_fixed_int(4)!.to_u32
+      column_type = packet.read_byte!
+      flags = packet.read_fixed_int(2)!.to_u16
+      decimal = packet.read_byte!
+      filler = packet.read_fixed_int(2)! # filler [00] [00]
+      return StreamError.new("Unexpected filler value #{filler}") unless filler == 0_u64
+
+      columns << ColumnSpec.new(catalog, schema, table, org_table, name, org_name, character_set, column_length, column_type, flags, decimal)
+    end
+
+    if count > 0
+      eof = read_packet!
+      header = eof.read_byte!
+      return handle_err_packet(eof) if header == 0xFF_u8
+      return StreamError.new("Expected an EOF packet after the column definitions, got #{header}") unless header == 0xFE_u8
+    end
+    columns
+  end
+
+  # --------------------------------------------------------------- commands
+
+  # COM_STMT_PREPARE: the statement's id, parameters and columns.
+  #
+  # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_prepare.html
+  def prepare(query : String) : PreparedStatementInfo | DBError
+    write_command(COM_STMT_PREPARE, query)!
+    packet = read_packet!
+    status = packet.read_byte!
+    return handle_err_packet(packet) if status == 0xFF_u8
+    return StreamError.new("Unexpected packet #{status} answering COM_STMT_PREPARE") unless status == 0x00_u8
+    statement_id = packet.read_int!
+    num_columns = packet.read_fixed_int(2)!
+    num_params = packet.read_fixed_int(2)!
+    packet.read_byte!         # reserved_1
+    packet.read_fixed_int(2)! # warning_count
+
+    params = read_column_definitions(num_params.to_i32)!
+    columns = read_column_definitions(num_columns.to_i32)!
+    PreparedStatementInfo.new(statement_id, params, columns)
+  end
+
+  # COM_STMT_CLOSE, which the server does not answer.
+  def close_statement(statement_id : Int32) : Nil | StreamError
+    packet = WritePacket.new
+    packet.write_byte(COM_STMT_CLOSE)
+    packet.write_u32(statement_id.unsafe_to_u32)
+    write_packet(0_u8, packet)
+  end
+
+  # Whether the socket is closed.
+  def closed? : Bool
+    @stream.closed?
+  end
+
+  # Sends COM_QUIT and closes the socket; what fails on the way is
+  # passed over, as crystal-mysql's `do_close` rescued it.
+  def close : Nil
+    return if @stream.closed?
+    write_command(COM_QUIT)
+    close_socket
+  end
+
+  protected def close_socket : Nil
+    @stream.close unless @stream.closed?
+  end
+end
