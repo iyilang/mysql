@@ -1,0 +1,505 @@
+# The column types of the protocol, and how a value of each is read - from
+# a binary row (a prepared statement's) or a text row (an unprepared
+# one's) - and bound as a prepared statement's argument. crystal-mysql's
+# `MySql::Type` and its `decl_type` structs, and `MySql::ColumnSpec`.
+#
+# What changed from crystal-mysql, each for the reason given where it is
+# done:
+#
+# * An `UNSIGNED` column reads as the unsigned type of its width
+#   (`TINYINT UNSIGNED` as `UInt8`, ...): crystal-mysql read 255 as -1.
+#   Unsigned arguments bind as unsigned.
+# * Whether a string column reads as `String` or `Bytes` is its character
+#   set's: binary (63) is `Bytes`, whatever the column type, so `BINARY`
+#   and `VARBINARY` are `Bytes` as `BLOB` is. `JSON` is always `String`.
+# * `YEAR`, `BIT`, `ENUM`, `SET`, `JSON` and `GEOMETRY` read, where
+#   crystal-mysql had no reader for them.
+# * A zero date (`0000-00-00`) answers a `DBError`: iyi's `Time` has no
+#   year 0, and crystal-mysql's `Time.local(0, 0, 0)` raised too.
+#
+# https://dev.mysql.com/doc/dev/mysql-server/latest/field__types_8h.html
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_binary_resultset.html
+module mysql/types
+
+import std/int
+import std/text
+import std/time::{Time, Span}
+import std/slice::{Slice, Bytes}
+import std/uuid::{UUID}
+import db/db/errors::{DBError, ArgumentError}
+import db/db/value::{DBValue, CustomValue}
+import mysql/errors::{StreamError}
+import mysql/packet::{ReadPacket, WritePacket}
+
+# A column type, by the code the protocol sends.
+pub enum Type : UInt8
+  Decimal    = 0x00
+  Tiny       = 0x01
+  Short      = 0x02
+  Long       = 0x03
+  Float      = 0x04
+  Double     = 0x05
+  Null       = 0x06
+  Timestamp  = 0x07
+  LongLong   = 0x08
+  Int24      = 0x09
+  Date       = 0x0a
+  Time       = 0x0b
+  DateTime   = 0x0c
+  Year       = 0x0d
+  VarChar    = 0x0f
+  Bit        = 0x10
+  Json       = 0xf5
+  NewDecimal = 0xf6
+  Enum       = 0xf7
+  Set        = 0xf8
+  TinyBlob   = 0xf9
+  MediumBlob = 0xfa
+  LongBlob   = 0xfb
+  Blob       = 0xfc
+  VarString  = 0xfd
+  String     = 0xfe
+  Geometry   = 0xff
+end
+
+# The character set of binary strings: a column in it reads as `Bytes`.
+pub BINARY_CHARSET = 63_u16
+
+# A column definition flag: the integer is unsigned.
+pub UNSIGNED_FLAG = 32_u16
+
+# A column definition flag: the column holds binary data.
+pub BINARY_FLAG = 128_u16
+
+# A column of a result, or a parameter of a prepared statement, as the
+# server describes it.
+#
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset_column_definition.html
+pub struct ColumnSpec
+  getter catalog : String
+  getter schema : String
+  getter table : String
+  getter org_table : String
+  getter name : String
+  getter org_name : String
+  getter character_set : UInt16
+  getter column_length : UInt32
+  getter column_type_code : UInt8
+  getter flags : UInt16
+  getter decimal : UInt8
+
+  def initialize(@catalog : String, @schema : String, @table : String, @org_table : String, @name : String, @org_name : String, @character_set : UInt16, @column_length : UInt32, @column_type_code : UInt8, @flags : UInt16, @decimal : UInt8)
+  end
+
+  # The column's type, nil for a code this driver does not know.
+  def column_type : Type?
+    Type.from_value?(@column_type_code)
+  end
+
+  # The type's name, `MySql::Type::VarString`, or its code when unknown.
+  def type_name : String
+    if t = column_type
+      "MySql::Type::#{t}"
+    else
+      "MySql::Type(0x#{@column_type_code.to_s(16)})"
+    end
+  end
+
+  def unsigned? : Bool
+    (@flags & UNSIGNED_FLAG) != 0_u16
+  end
+
+  # Whether the binary flag is set: `BINARY`, `VARBINARY` and the `BLOB`s.
+  def binary_flag? : Bool
+    (@flags & BINARY_FLAG) != 0_u16
+  end
+
+  # Whether the column's character set is binary.
+  def binary_charset? : Bool
+    @character_set == BINARY_CHARSET
+  end
+end
+
+# A `UUID` bound as an argument, or read with `read(UUIDValue)`: its 16
+# bytes, a `BINARY(16)` or `BLOB` value. crystal-mysql bound a `UUID` as
+# its bytes; a `UUID` is not a `DBValue` (iyi-db's union is closed), so it
+# is wrapped: `UUIDValue.new(uuid)`.
+pub class UUIDValue < CustomValue
+  getter uuid : UUID
+
+  def initialize(@uuid : UUID)
+  end
+
+  def ==(other : UUIDValue) : Bool
+    uuid == other.uuid
+  end
+
+  def to_s : String
+    uuid.to_s
+  end
+end
+
+# The UUID in *bytes*, which must be 16. The message is crystal-mysql's,
+# whose `UUID.new(bytes)` raised it.
+pub def uuid_from(bytes : Bytes) : UUID | DBError
+  return ArgumentError.new("Invalid bytes length #{bytes.size}, expected 16") unless bytes.size == 16
+  UUID.new(Array(UInt8).new(16) { |i| bytes[i] })
+end
+
+pub def bytes_string(bytes : Bytes) : String
+  String.new(bytes.size) { |buffer| buffer.copy_from(bytes.to_unsafe, bytes.size) }
+end
+
+# The float whose IEEE 754 bits are *bits*, and back. Each its own def, so
+# its local has the one type a pointer to it reads.
+def f32_from_bits(bits : UInt32) : Float32
+  pointerof(bits).as(Float32*).value
+end
+
+def f64_from_bits(bits : UInt64) : Float64
+  pointerof(bits).as(Float64*).value
+end
+
+def f32_bits(value : Float32) : UInt32
+  pointerof(value).as(UInt32*).value
+end
+
+def f64_bits(value : Float64) : UInt64
+  pointerof(value).as(UInt64*).value
+end
+
+pub def string_bytes(text : String) : Bytes
+  slice = Bytes.new(text.bytesize)
+  slice.to_unsafe.copy_from(text.to_unsafe, text.bytesize)
+  slice
+end
+
+# ------------------------------------------------------------------ reading
+
+# The value of *column* in a binary row, *packet* at its first byte.
+pub def read_binary(packet : ReadPacket, column : ColumnSpec) : DBValue | DBError
+  unsigned = column.unsigned?
+  case column.column_type
+  when Type::Tiny
+    byte = packet.read_byte!
+    unsigned ? byte : byte.unsafe_to_i8
+  when Type::Short, Type::Year
+    value = packet.read_fixed_int(2)!
+    unsigned ? value.to_u16 : value.to_u16.unsafe_to_i16
+  when Type::Long, Type::Int24
+    value = packet.read_fixed_int(4)!
+    unsigned ? value.to_u32 : value.to_u32.unsafe_to_i32
+  when Type::LongLong
+    value = packet.read_fixed_int(8)!
+    unsigned ? value : value.unsafe_to_i64
+  when Type::Float
+    f32_from_bits(packet.read_fixed_int(4)!.to_u32)
+  when Type::Double
+    f64_from_bits(packet.read_fixed_int(8)!)
+  when Type::Null
+    nil
+  when Type::Decimal, Type::NewDecimal
+    parse_float(packet.read_lenenc_string!, column)
+  when Type::Timestamp, Type::Date, Type::DateTime
+    read_binary_time(packet, column)
+  when Type::Time
+    read_binary_span(packet)
+  when Type::Json
+    packet.read_lenenc_string
+  when Type::Bit, Type::Geometry
+    packet.read_blob
+  else
+    # The string and blob types, ENUM and SET, and any type the server
+    # sends that this driver does not name: a length-encoded string.
+    string_or_bytes(packet.read_blob!, column)
+  end
+end
+
+# A string column's bytes as a `String`, or as `Bytes` when its character
+# set is binary.
+def string_or_bytes(bytes : Bytes, column : ColumnSpec) : String | Bytes
+  column.binary_charset? ? bytes : bytes_string(bytes)
+end
+
+# A `DATE`, `DATETIME` or `TIMESTAMP` of a binary row: a length, then as
+# many of year, month, day, hour, minute, second and microsecond as it
+# says.
+def read_binary_time(packet : ReadPacket, column : ColumnSpec) : Time | DBError
+  length = packet.read_byte!
+  return zero_date(column) if length < 1
+  year = packet.read_fixed_int(2)!.to_i32
+  month = packet.read_byte!.to_i32
+  day = packet.read_byte!.to_i32
+  hour = minute = second = microsecond = 0
+  if length >= 7
+    hour = packet.read_byte!.to_i32
+    minute = packet.read_byte!.to_i32
+    second = packet.read_byte!.to_i32
+  end
+  microsecond = packet.read_fixed_int(4)!.to_i32 if length >= 11
+  make_time(year, month, day, hour, minute, second, microsecond, column)
+end
+
+# A `TIME` of a binary row: a length, then the sign, days, hours, minutes,
+# seconds and microseconds as it says.
+def read_binary_span(packet : ReadPacket) : Span | DBError
+  length = packet.read_byte!
+  return Span.zero if length < 1
+  negative = packet.read_byte! != 0_u8
+  days = packet.read_fixed_int(4)!.to_i64
+  hours = packet.read_byte!.to_i64
+  minutes = packet.read_byte!.to_i64
+  seconds = packet.read_byte!.to_i64
+  microseconds = length > 8 ? packet.read_fixed_int(4)!.to_i64 : 0_i64
+  span = Span.new(days: days, hours: hours, minutes: minutes, seconds: seconds, nanoseconds: microseconds * 1000_i64)
+  negative ? -span : span
+end
+
+# The value of *column* from its text, *text*: what a text row holds.
+pub def parse_text(text : String, column : ColumnSpec) : DBValue | DBError
+  unsigned = column.unsigned?
+  case column.column_type
+  when Type::Tiny
+    unsigned ? parse_int(text, column, 0_i64, 255_i64)!.to_u8 : parse_int(text, column, -128_i64, 127_i64)!.to_i8
+  when Type::Short, Type::Year
+    unsigned ? parse_int(text, column, 0_i64, 65535_i64)!.to_u16 : parse_int(text, column, -32768_i64, 32767_i64)!.to_i16
+  when Type::Long, Type::Int24
+    unsigned ? parse_int(text, column, 0_i64, 4294967295_i64)!.to_u32 : parse_int(text, column, -2147483648_i64, 2147483647_i64)!.to_i32
+  when Type::LongLong
+    if unsigned
+      text.to_u64? || not_a(column, text, "UInt64")
+    else
+      text.to_i64? || not_a(column, text, "Int64")
+    end
+  when Type::Float
+    value = parse_float(text, column)
+    value.is_a?(DBError) ? value : value.to_f32
+  when Type::Double, Type::Decimal, Type::NewDecimal
+    parse_float(text, column)
+  when Type::Null
+    nil
+  when Type::Timestamp, Type::Date, Type::DateTime
+    parse_time(text, column)
+  when Type::Time
+    parse_span(text, column)
+  when Type::Json
+    text
+  when Type::Bit, Type::Geometry
+    string_bytes(text)
+  else
+    column.binary_charset? ? string_bytes(text) : text
+  end
+end
+
+def parse_int(text : String, column : ColumnSpec, min : Int64, max : Int64) : Int64 | DBError
+  value = text.to_i64?
+  return not_a(column, text, "integer") if value.nil? || value < min || value > max
+  value
+end
+
+def parse_float(text : String, column : ColumnSpec) : Float64 | DBError
+  text.to_f? || not_a(column, text, "number")
+end
+
+def not_a(column : ColumnSpec, text : String, what : String) : DBError
+  DBError.new("The column #{column.name} of type #{column.type_name} holds #{text.inspect}, which is not a #{what}")
+end
+
+def zero_date(column : ColumnSpec) : DBError
+  DBError.new("The column #{column.name} holds the zero date 0000-00-00, which is no Time")
+end
+
+# The digits of *text* from *start*, *count* of them; nil when one is not a
+# digit or the text ends first.
+def digits(text : String, start : Int32, count : Int32) : Int32?
+  return nil if start + count > text.bytesize
+  value = 0
+  p = text.to_unsafe
+  count.times do |i|
+    c = p[start + i].to_i32
+    return nil if c < 48 || c > 57
+    value = value * 10 + (c - 48)
+  end
+  value
+end
+
+# The microseconds of a fraction `.f...` starting at *start*, the dot
+# included: 0 when there is none, nil when it is not digits.
+def fraction(text : String, start : Int32) : Int32?
+  return 0 if start >= text.bytesize
+  p = text.to_unsafe
+  return nil unless p[start] == 46_u8
+  value = 0
+  scale = 0
+  i = start + 1
+  while i < text.bytesize
+    c = p[i].to_i32
+    return nil if c < 48 || c > 57
+    if scale < 6
+      value = value * 10 + (c - 48)
+      scale += 1
+    end
+    i += 1
+  end
+  while scale < 6
+    value *= 10
+    scale += 1
+  end
+  value
+end
+
+# The byte of *text* at *index*, 0 past its end.
+def byte_at(text : String, index : Int32) : UInt8
+  index < text.bytesize ? text.to_unsafe[index] : 0_u8
+end
+
+# A `DATE`, `DATETIME` or `TIMESTAMP` from its text: `2016-02-15`,
+# `2016-02-15 10:15:30` or `2016-02-15 10:15:30.543012`, in UTC.
+def parse_time(text : String, column : ColumnSpec) : Time | DBError
+  return zero_date(column) if text.starts_with?("0000-00-00")
+  year = digits(text, 0, 4)
+  month = digits(text, 5, 2)
+  day = digits(text, 8, 2)
+  if year.nil? || month.nil? || day.nil? || byte_at(text, 4) != 45_u8 || byte_at(text, 7) != 45_u8
+    return not_a(column, text, "date")
+  end
+  return make_time(year, month, day, 0, 0, 0, 0, column) if text.bytesize == 10
+  hour = digits(text, 11, 2)
+  minute = digits(text, 14, 2)
+  second = digits(text, 17, 2)
+  micro = fraction(text, 19)
+  if hour.nil? || minute.nil? || second.nil? || micro.nil? || byte_at(text, 10) != 32_u8
+    return not_a(column, text, "date and time")
+  end
+  make_time(year, month, day, hour, minute, second, micro, column)
+end
+
+# A `TIME` from its text: `10:15:30`, `-838:59:59`, `10:15:30.543012`.
+def parse_span(text : String, column : ColumnSpec) : Span | DBError
+  negative = text.starts_with?('-')
+  start = negative ? 1 : 0
+  colon = text.index(':', start)
+  return not_a(column, text, "time") if colon.nil?
+  hours = digits(text, start, colon - start)
+  minutes = digits(text, colon + 1, 2)
+  seconds = digits(text, colon + 4, 2)
+  micro = fraction(text, colon + 6)
+  if hours.nil? || minutes.nil? || seconds.nil? || micro.nil? || colon == start || byte_at(text, colon + 3) != 58_u8
+    return not_a(column, text, "time")
+  end
+  span = Span.new(hours: hours.to_i64, minutes: minutes.to_i64, seconds: seconds.to_i64, nanoseconds: micro.to_i64 * 1000_i64)
+  negative ? -span : span
+end
+
+def make_time(year : Int32, month : Int32, day : Int32, hour : Int32, minute : Int32, second : Int32, microsecond : Int32, column : ColumnSpec) : Time | DBError
+  return zero_date(column) if year == 0 && month == 0 && day == 0
+  if year < 1 || month < 1 || month > 12 || day < 1 || day > Time.days_in_month(year, month) ||
+     hour > 23 || minute > 59 || second > 59 || microsecond > 999999
+    return DBError.new("The column #{column.name} holds #{year}-#{month}-#{day} #{hour}:#{minute}:#{second}, which is no Time")
+  end
+  Time.utc(year, month, day, hour, minute, second, nanosecond: microsecond * 1000)
+end
+
+# ------------------------------------------------------------------ binding
+
+# The type code an argument is bound as, and whether it is unsigned.
+pub def param_type(arg : DBValue) : {UInt8, Bool} | DBError
+  case arg
+  when Nil       then {Type::Null.value, false}
+  when Bool      then {Type::Tiny.value, false}
+  when Int8      then {Type::Tiny.value, false}
+  when UInt8     then {Type::Tiny.value, true}
+  when Int16     then {Type::Short.value, false}
+  when UInt16    then {Type::Short.value, true}
+  when Int32     then {Type::Long.value, false}
+  when UInt32    then {Type::Long.value, true}
+  when Int64     then {Type::LongLong.value, false}
+  when UInt64    then {Type::LongLong.value, true}
+  when Float32   then {Type::Float.value, false}
+  when Float64   then {Type::Double.value, false}
+  when Char      then {Type::String.value, false}
+  when String    then {Type::String.value, false}
+  when Bytes     then {Type::Blob.value, false}
+  when UUIDValue then {Type::Blob.value, false}
+  when Time      then {Type::DateTime.value, false}
+  when Span      then {Type::Time.value, false}
+  else
+    DBError.new("MySql::Type does not support #{arg.class} values")
+  end
+end
+
+# Writes *arg*, not nil, in the binary protocol's form of its type.
+pub def write_param(packet : WritePacket, arg : DBValue) : Nil | DBError
+  case arg
+  when Bool
+    packet.write_byte(arg ? 1_u8 : 0_u8)
+  when Int8
+    packet.write_byte(arg.unsafe_to_u8)
+  when UInt8
+    packet.write_byte(arg)
+  when Int16
+    packet.write_fixed_int(arg.to_i64.unsafe_to_u64, 2)
+  when UInt16
+    packet.write_fixed_int(arg.to_u64, 2)
+  when Int32
+    packet.write_fixed_int(arg.to_i64.unsafe_to_u64, 4)
+  when UInt32
+    packet.write_fixed_int(arg.to_u64, 4)
+  when Int64
+    packet.write_fixed_int(arg.unsafe_to_u64, 8)
+  when UInt64
+    packet.write_fixed_int(arg, 8)
+  when Float32
+    packet.write_fixed_int(f32_bits(arg).to_u64, 4)
+  when Float64
+    packet.write_fixed_int(f64_bits(arg), 8)
+  when Char
+    packet.write_lenenc_string(arg.to_s)
+  when String
+    packet.write_lenenc_string(arg)
+  when Bytes
+    packet.write_blob(arg)
+  when UUIDValue
+    packet.write_lenenc_int(16_u64)
+    packet.write(arg.uuid.bytes)
+  when Time
+    write_time(packet, arg)
+  when Span
+    write_span(packet, arg)!
+  else
+    return DBError.new("MySql::Type does not support #{arg.class} values")
+  end
+  nil
+end
+
+# A `DATETIME`: eleven bytes, the time in UTC to the microsecond.
+def write_time(packet : WritePacket, v : Time) : Nil
+  t = v.to_utc
+  packet.write_byte(11_u8)
+  packet.write_fixed_int(t.year.to_u64, 2)
+  packet.write_byte(t.month.to_u8)
+  packet.write_byte(t.day.to_u8)
+  packet.write_byte(t.hour.to_u8)
+  packet.write_byte(t.minute.to_u8)
+  packet.write_byte(t.second.to_u8)
+  packet.write_fixed_int((t.nanosecond // 1000).to_u64, 4)
+end
+
+# A `TIME`: twelve bytes, the sign, days, hours, minutes, seconds and
+# microseconds. MySQL's `TIME` goes to 838:59:59, 34 days and some.
+def write_span(packet : WritePacket, v : Span) : Nil | DBError
+  negative = v < Span.zero
+  span = negative ? -v : v
+  d = span.days
+  if d > 34
+    return ArgumentError.new("MYSQL TIME over 34 days cannot be saved - https://dev.mysql.com/doc/refman/5.7/en/time.html")
+  end
+  packet.write_byte(12_u8)
+  packet.write_byte(negative ? 1_u8 : 0_u8)
+  packet.write_fixed_int(d.to_u64, 4)
+  packet.write_byte(span.hours.to_u8)
+  packet.write_byte(span.minutes.to_u8)
+  packet.write_byte(span.seconds.to_u8)
+  packet.write_fixed_int((span.nanoseconds // 1000).to_u64, 4)
+  nil
+end
