@@ -1,0 +1,164 @@
+# What this driver reads and binds beyond crystal-mysql's specs, in both
+# protocols: the unsigned integers, the types crystal-mysql had no reader
+# for, binary strings, negative times, zero dates, and statements that
+# answer what their method does not expect.
+module mysql/types_test
+
+import std/time::{Time, Span}
+import std/slice::{Slice, Bytes}
+import db
+import db/db/core::{Database, Connection}
+import db/db/errors::*
+import db/db/value::{DBValue}
+import db/db/spec::{describe, it, expect_error}
+import mysql/errors::{PacketError}
+import mysql/core::{MySqlConnection}
+import mysql/testing/spec_helper::{with_db, db_url}
+
+# The row of `select *` from *table*, read through prepared and through
+# unprepared statements, each as `Array(DBValue)`.
+def both_rows(db : Database, sql : String) : {Array(DBValue), Array(DBValue)}
+  rows = [] of Array(DBValue)
+  [true, false].each do |prepared|
+    row = [] of DBValue
+    query = prepared ? db.prepared : db.unprepared
+    query.query(sql) do |rs|
+      rs.each do
+        rs.column_count.times { row << rs.read.or_panic }
+      end.or_panic
+    end.or_panic
+    rows << row
+  end
+  {rows[0], rows[1]}
+end
+
+describe "MySql types" do
+  it "reads unsigned integers as unsigned, in both protocols" do
+    with_db "crystal_mysql_test" do |db|
+      db.exec("create table t (a tinyint unsigned, b smallint unsigned, c mediumint unsigned, d int unsigned, e bigint unsigned)").or_panic
+      db.exec("insert into t values (255, 65535, 16777215, 4294967295, 18446744073709551615)").or_panic
+      prepared, text = both_rows(db, "select * from t")
+      expected = [255_u8, 65535_u16, 16777215_u32, 4294967295_u32, 18446744073709551615_u64]
+      assert prepared == expected, prepared.inspect
+      assert text == expected, text.inspect
+    end
+  end
+
+  it "binds unsigned integers as unsigned" do
+    with_db "crystal_mysql_test" do |db|
+      db.exec("create table t (e bigint unsigned, a tinyint unsigned)").or_panic
+      db.exec("insert into t values (?, ?)", 18446744073709551615_u64, 200_u8).or_panic
+      assert db.query_one("select e, a from t", as: Tuple(UInt64, UInt8)).or_panic == {18446744073709551615_u64, 200_u8}
+    end
+  end
+
+  it "reads json, year, bit, enum, set, decimal and binary strings" do
+    with_db "crystal_mysql_test" do |db|
+      db.exec("create table t (j json, y year, b bit(3), e enum('a','b'), s set('x','y'), d decimal(5,2), vb varbinary(4), ch char(3))").or_panic
+      db.exec(%(insert into t values ('{"a": 1}', 2024, b'101', 'b', 'x,y', 12.5, X'00FF', 'abc'))).or_panic
+      prepared, text = both_rows(db, "select * from t")
+      [prepared, text].each do |row|
+        assert row[0] == %({"a": 1}), row.inspect
+        assert row[1].to_s == "2024", row.inspect
+        assert row[2] == Bytes.new(1, 5_u8), row.inspect
+        assert row[3] == "b", row.inspect
+        assert row[4] == "x,y", row.inspect
+        assert row[5] == 12.5, row.inspect
+        vb = Bytes.new(2)
+        vb[1] = 255_u8
+        assert row[6] == vb, row.inspect
+        assert row[7] == "abc", row.inspect
+      end
+    end
+  end
+
+  it "reads and binds negative and long times" do
+    with_db "crystal_mysql_test" do |db|
+      db.exec("create table t (tm time(6))").or_panic
+      span = -Span.new(hours: 838_i64, minutes: 59_i64, seconds: 58_i64, nanoseconds: 500_000_000_i64)
+      db.exec("insert into t values (?)", span).or_panic
+      prepared, text = both_rows(db, "select tm from t")
+      assert prepared == [span.as(DBValue)], prepared.inspect
+      assert text == [span.as(DBValue)], text.inspect
+      assert db.unprepared.scalar("select cast(tm as char) from t").or_panic == "-838:59:58.500000"
+    end
+  end
+
+  it "refuses a TIME of more than 34 days" do
+    with_db "crystal_mysql_test" do |db|
+      expect_error(db.scalar("select ?", Span.new(days: 35_i64)), ArgumentError, "MYSQL TIME over 34 days", partial: true)
+      nil
+    end
+  end
+
+  it "answers an error for a zero date, and goes on" do
+    with_db "crystal_mysql_test" do |db|
+      db.using_connection do |cnn|
+        cnn.exec("set session sql_mode = ''").or_panic
+        cnn.exec("create table t (d datetime, n int)").or_panic
+        cnn.exec("insert into t values ('0000-00-00 00:00:00', 1)").or_panic
+        [cnn.prepared, cnn.unprepared].each do |query|
+          query.query("select d, n from t") do |rs|
+            assert rs.move_next.or_panic
+            expect_error(rs.read(Time), DBError, "zero date", partial: true)
+            assert rs.read(Int32).or_panic == 1
+          end.or_panic
+        end
+      end.or_panic
+    end
+  end
+
+  it "reads the rows of a statement run with exec, and answers none for a query that has none" do
+    with_db "crystal_mysql_test" do |db|
+      db.using_connection do |cnn|
+        cnn.exec("create table t (n int)").or_panic
+        result = cnn.exec("select 1 union select 2").or_panic
+        assert result.rows_affected == 0
+        cnn.query("insert into t values (1)") do |rs|
+          assert !rs.move_next.or_panic
+        end.or_panic
+        assert cnn.scalar("select count(*) from t").or_panic == 1
+        assert cnn.unprepared.scalar("select count(*) from t").or_panic == 1
+      end.or_panic
+    end
+  end
+
+  it "refuses arguments the statement does not take" do
+    with_db "crystal_mysql_test" do |db|
+      expect_error(db.scalar("select ?, ?", 1), DBError, "The statement takes 2 parameters, 1 were given")
+      expect_error(db.unprepared.exec("select 1", 1), DBError, "exec/query with args is not supported")
+      assert db.scalar("select 1").or_panic == 1
+    end
+  end
+
+  it "answers the server's error with its code and state" do
+    with_db "crystal_mysql_test" do |db|
+      error = expect_error(db.exec("select * from no_such_table"), PacketError)
+      assert error.code == 1146
+      assert error.sql_state == "42S02"
+      assert error.message.includes?("no_such_table")
+    end
+  end
+
+  it "closes a statement on the server when it is closed" do
+    ::Db.connect(db_url(nil, "prepared_statements_cache=false")) do |cnn|
+      before = closes(cnn)
+      3.times { cnn.scalar("select 1").or_panic }
+      assert closes(cnn) >= before + 3
+    end.or_panic
+  end
+
+  it "reconnects when the server ends a session" do
+    with_db "crystal_mysql_test", "max_pool_size=1" do |db|
+      id = db.scalar("select connection_id()").or_panic
+      ::Db.connect(db_url) { |other| other.exec("kill #{id}").or_panic }.or_panic
+      assert db.scalar("select connection_id()").or_panic != id
+    end
+  end
+end
+
+# How many statements the session closed (COM_STMT_CLOSE), as the server
+# counts them.
+def closes(cnn : Connection) : Int32
+  cnn.unprepared.query_one("show session status like 'Com_stmt_close'", as: Tuple(String, String)).or_panic[1].to_i? || 0
+end

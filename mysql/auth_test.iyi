@@ -1,0 +1,95 @@
+# The authentication plugins crystal-mysql did not speak, and the
+# exchanges of each: an AuthSwitchRequest to `mysql_native_password` from
+# MySQL 8.0's `caching_sha2_password` greeting, `caching_sha2_password`'s
+# full authentication (the password under the server's RSA key, with no
+# TLS) and its fast one, `sha256_password`, and an empty password.
+#
+# Each plugin's examples run when the server has it active, and are
+# skipped, with a note, otherwise. They connect with `ssl-mode=disabled`
+# whatever `DATABASE_URL` says, so the RSA exchange is the one run.
+module mysql/auth_test
+
+import db
+import db/db/core::{Database}
+import db/db/errors::*
+import db/db/spec::{describe, it, expect_error}
+import mysql/core
+import mysql/errors::{PacketError}
+import mysql/testing/spec_helper::{db_url, db_url_as, run_sql}
+
+def plugin_active?(name : String) : Bool
+  active = false
+  ::Db.open(db_url) do |db|
+    count = db.scalar("SELECT COUNT(*) FROM information_schema.PLUGINS WHERE PLUGIN_NAME = ? AND PLUGIN_STATUS = 'ACTIVE'", name).or_panic
+    active = count != 0
+  end.or_panic
+  active
+end
+
+# Runs the block with the user *user* identified by *password* through
+# *plugin*, dropped after.
+def with_user(user : String, plugin : String, password : String, & : -> Nil) : Nil
+  run_sql("DROP USER IF EXISTS #{user}", "CREATE USER #{user} IDENTIFIED WITH #{plugin} BY '#{password}'")
+  defer run_sql("DROP USER IF EXISTS #{user}")
+  yield
+end
+
+def current_user(url : String) : String
+  user = ""
+  ::Db.open(url) { |db| user = db.scalar("SELECT CURRENT_USER()").or_panic.as(String) }.or_panic
+  user
+end
+
+def plain(user : String, password : String) : String
+  db_url_as(user, password, nil, "ssl-mode=disabled")
+end
+
+describe "Authentication" do
+  it "answers an AuthSwitchRequest for mysql_native_password" do
+    if plugin_active?("mysql_native_password")
+      with_user "iyi_native", "mysql_native_password", "secret" do
+        assert current_user(plain("iyi_native", "secret")).starts_with?("iyi_native@")
+      end
+    else
+      STDERR.puts "skipped: mysql_native_password is not active on the server"
+    end
+  end
+
+  it "speaks caching_sha2_password, fully under RSA and then fast" do
+    if plugin_active?("caching_sha2_password")
+      with_user "iyi_sha2", "caching_sha2_password", "secret" do
+        # the cache is empty: the password goes under the server's key
+        run_sql("FLUSH PRIVILEGES")
+        assert current_user(plain("iyi_sha2", "secret")).starts_with?("iyi_sha2@")
+        # cached now: the scramble alone
+        assert current_user(plain("iyi_sha2", "secret")).starts_with?("iyi_sha2@")
+        run_sql("FLUSH PRIVILEGES")
+        error = expect_error(::Db.open(plain("iyi_sha2", "wrong")), ConnectionRefused)
+        cause = error.cause
+        assert cause.is_a?(PacketError) && cause.code == 1045, cause.inspect
+      end
+    else
+      STDERR.puts "skipped: caching_sha2_password is not active on the server"
+    end
+  end
+
+  it "speaks sha256_password under RSA" do
+    if plugin_active?("sha256_password")
+      with_user "iyi_sha256", "sha256_password", "secret" do
+        assert current_user(plain("iyi_sha256", "secret")).starts_with?("iyi_sha256@")
+      end
+    else
+      STDERR.puts "skipped: sha256_password is not active on the server"
+    end
+  end
+
+  it "connects with an empty password" do
+    if plugin_active?("caching_sha2_password")
+      with_user "iyi_nopass", "caching_sha2_password", "" do
+        assert current_user(db_url_as("iyi_nopass", "", nil, "ssl-mode=disabled")).starts_with?("iyi_nopass@")
+      end
+    else
+      STDERR.puts "skipped: caching_sha2_password is not active on the server"
+    end
+  end
+end

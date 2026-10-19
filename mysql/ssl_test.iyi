@@ -1,0 +1,93 @@
+# TLS against a server whose certificate std/tls can check: they run when
+# `SSL_CA` names the file of the CA that signed it, for the host
+# `DATABASE_URL` names, and are skipped, with a note, otherwise. The
+# client certificate example runs when `SSL_CLIENT_CERT` and
+# `SSL_CLIENT_KEY` name a certificate that CA signed for
+# `CN=iyi_client`, and its key.
+#
+# The server is given such a certificate with `ssl_ca`, `ssl_cert`,
+# `ssl_key` and `ALTER INSTANCE RELOAD TLS` (MySQL 8.0.16 and later); the
+# CI workflow shows how.
+module mysql/ssl_test
+
+import std/env
+import std/uri::{URI}
+import db
+import db/db/core::{Database}
+import db/db/errors::*
+import db/db/spec::{describe, it, expect_error}
+import mysql/core
+import mysql/errors::{ConnectionError, PacketError}
+import mysql/testing/spec_helper::{db_url, run_sql}
+
+SSL_CIPHER = "SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME = 'Ssl_cipher'"
+
+# The test server's URL with no TLS parameter but *options*: whatever
+# `DATABASE_URL` says about TLS, each example says its own.
+def url(options : String, user : String? = nil, password : String? = nil) : String
+  uri = URI.parse(db_url)
+  params = uri.query_params
+  ["ssl-mode", "ssl-ca", "ssl-cert", "ssl-key"].each { |key| params.delete(key) }
+  uri.query = params.empty? ? nil : params.to_s
+  if u = user
+    uri.user = u
+    uri.password = password
+  end
+  plain = uri.to_s
+  plain + (plain.includes?("?") ? "&" : "?") + options
+end
+
+def cipher(url : String) : String
+  value = ""
+  ::Db.open(url) { |db| value = db.scalar(SSL_CIPHER).or_panic.as(String) }.or_panic
+  value
+end
+
+if ca = ENV["SSL_CA"]?
+  describe "TLS" do
+    it "encrypts with ssl-mode=required, checking the certificate against ssl-ca" do
+      assert cipher(url("ssl-mode=required&ssl-ca=#{ca}")) != ""
+    end
+
+    it "encrypts with ssl-mode=verify_identity" do
+      assert cipher(url("ssl-mode=verify_identity&ssl-ca=#{ca}")) != ""
+    end
+
+    it "encrypts with ssl-mode=preferred when the certificate is trusted" do
+      assert cipher(url("ssl-mode=preferred&ssl-ca=#{ca}")) != ""
+    end
+
+    it "goes on unencrypted with ssl-mode=preferred when the certificate is not trusted" do
+      # the system's roots do not hold the test CA
+      assert cipher(url("ssl-mode=preferred")) == ""
+    end
+
+    it "refuses ssl-mode=required when the certificate is not trusted" do
+      error = expect_error(::Db.open(url("ssl-mode=required")), ConnectionRefused)
+      assert error.message.includes?("TLS handshake failed"), error.message
+    end
+
+    it "refuses a CA file that cannot be read" do
+      error = expect_error(::Db.open(url("ssl-mode=required&ssl-ca=no/such/ca.pem")), ConnectionRefused)
+      assert error.message.includes?("could not read CA certificate file"), error.message
+    end
+
+    it "sends the client certificate to a server that asks for it" do
+      cert = ENV["SSL_CLIENT_CERT"]?
+      key = ENV["SSL_CLIENT_KEY"]?
+      if cert && key
+        run_sql("DROP USER IF EXISTS iyi_x509", "CREATE USER iyi_x509 IDENTIFIED BY 'secret' REQUIRE SUBJECT '/CN=iyi_client'")
+        defer run_sql("DROP USER IF EXISTS iyi_x509")
+        with_cert = url("ssl-mode=required&ssl-ca=#{ca}&ssl-cert=#{cert}&ssl-key=#{key}", "iyi_x509", "secret")
+        assert cipher(with_cert) != ""
+        without = url("ssl-mode=required&ssl-ca=#{ca}", "iyi_x509", "secret")
+        error = expect_error(::Db.open(without), ConnectionRefused)
+        assert error.cause.is_a?(PacketError), error.inspect
+      else
+        STDERR.puts "skipped: sends the client certificate (SSL_CLIENT_CERT and SSL_CLIENT_KEY are not set)"
+      end
+    end
+  end
+else
+  STDERR.puts "skipped: TLS (SSL_CA is not set)"
+end
