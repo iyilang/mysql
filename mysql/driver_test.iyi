@@ -1,0 +1,134 @@
+# crystal-mysql's spec/driver_spec.cr.
+#
+# "should be able to connect with ssl" needs a server whose certificate
+# std/tls trusts for the test host: it runs when `SSL_CA` names the file
+# of the CA that signed it, and is skipped, with a note, otherwise. A
+# MySQL server's auto-generated certificate names no host, and so is
+# trusted for none (`mysql/ssl`).
+module mysql/driver_test
+
+import std/env
+import db
+import db/db/core::{Database}
+import db/db/spec::{describe, it}
+import mysql/core::{MySqlDriver}
+import mysql/testing/spec_helper::*
+
+def with_server(& : Database -> Nil) : Nil
+  ::Db.open(db_url) { |db| yield db }.or_panic
+end
+
+def with_server(initial_db : String?, options : String, & : Database -> Nil) : Nil
+  ::Db.open(db_url(initial_db, options)) { |db| yield db }.or_panic
+end
+
+def at_least?(version : {Int32, Int32, Int32}, major : Int32, minor : Int32) : Bool
+  version[0] > major || (version[0] == major && version[1] >= minor)
+end
+
+SSL_CIPHER = "SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME = 'Ssl_cipher'"
+
+describe "Driver" do
+  it "should register mysql name" do
+    assert ::Db.driver_class("mysql").or_panic == MySqlDriver
+  end
+
+  it "should connect with credentials" do
+    with_server do |db|
+      assert db.scalar("SELECT DATABASE()").or_panic.nil?
+      assert db.scalar("SELECT CURRENT_USER()").or_panic.as(String).starts_with?("root@")
+
+      # ensure user is deleted
+      if at_least?(mysql_version(db), 5, 7)
+        db.exec("DROP USER IF EXISTS crystal_test").or_panic
+      else
+        db.exec("GRANT USAGE ON *.* TO crystal_test IDENTIFIED BY 'secret'").or_panic
+        db.exec("DROP USER crystal_test").or_panic
+      end
+      db.exec("DROP DATABASE IF EXISTS crystal_mysql_test").or_panic
+      db.exec("FLUSH PRIVILEGES").or_panic
+
+      # create test db with user
+      db.exec("CREATE DATABASE crystal_mysql_test").or_panic
+      db.exec("CREATE USER crystal_test IDENTIFIED BY 'secret'").or_panic
+      db.exec("GRANT ALL PRIVILEGES ON crystal_mysql_test.* TO crystal_test").or_panic
+      db.exec("FLUSH PRIVILEGES").or_panic
+    end
+
+    ::Db.open(db_url_as("crystal_test", "secret", "crystal_mysql_test")) do |db|
+      assert db.scalar("SELECT DATABASE()").or_panic == "crystal_mysql_test"
+      assert db.scalar("SELECT CURRENT_USER()").or_panic.as(String).starts_with?("crystal_test@")
+    end.or_panic
+
+    with_server do |db|
+      db.exec("DROP DATABASE IF EXISTS crystal_mysql_test").or_panic
+    end
+  end
+
+  it "should connect with default encoding & collation for the connection set to utf8" do
+    with_server do |db|
+      db.exec("DROP DATABASE IF EXISTS crystal_mysql_test").or_panic
+      db.exec("CREATE DATABASE crystal_mysql_test").or_panic
+
+      # By default, the encoding for the  DB connection is set to utf8_general_ci,
+      # which MySQL 8.0 names utf8mb3_general_ci
+      ::Db.open(db_url_as("crystal_test", "secret", "crystal_mysql_test")) do |db|
+        assert db.scalar("SELECT @@collation_connection").or_panic.in?("utf8_general_ci", "utf8mb3_general_ci")
+        assert db.scalar("SELECT @@character_set_connection").or_panic.in?("utf8", "utf8mb3")
+      end.or_panic
+      db.exec("DROP DATABASE IF EXISTS crystal_mysql_test").or_panic
+    end
+  end
+
+  it "should connect with requested encoding" do
+    with_server do |db|
+      db.exec("DROP DATABASE IF EXISTS crystal_mysql_test").or_panic
+      db.exec("CREATE DATABASE crystal_mysql_test").or_panic
+
+      ::Db.open(db_url_as("crystal_test", "secret", "crystal_mysql_test", "encoding=utf8mb4_unicode_520_ci")) do |db|
+        assert db.scalar("SELECT @@collation_connection").or_panic == "utf8mb4_unicode_520_ci"
+        assert db.scalar("SELECT @@character_set_connection").or_panic == "utf8mb4"
+      end.or_panic
+      db.exec("DROP DATABASE IF EXISTS crystal_mysql_test").or_panic
+    end
+  end
+
+  it "should be able to connect without ssl" do
+    with_server nil, "ssl-mode=disabled" do |db|
+      assert db.scalar(SSL_CIPHER).or_panic == ""
+    end
+  end
+
+  it "should be able to connect with ssl" do
+    if ca = ENV["SSL_CA"]?
+      with_server nil, "ssl-mode=required&ssl-ca=#{ca}" do |db|
+        assert db.scalar(SSL_CIPHER).or_panic != ""
+      end
+    else
+      STDERR.puts "skipped: should be able to connect with ssl (SSL_CA is not set)"
+    end
+  end
+
+  it "create and drop test database" do
+    sql = "SELECT count(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'crystal_mysql_test'"
+
+    with_server do |db|
+      db.exec("DROP DATABASE IF EXISTS crystal_mysql_test").or_panic
+      db.exec("CREATE DATABASE crystal_mysql_test").or_panic
+      ::Db.open(db_url("crystal_mysql_test")) do |db|
+        assert db.scalar(sql).or_panic == 1
+        assert db.scalar("SELECT DATABASE()").or_panic == "crystal_mysql_test"
+      end.or_panic
+      db.exec("DROP DATABASE IF EXISTS crystal_mysql_test").or_panic
+    end
+
+    with_server do |db|
+      assert db.scalar(sql).or_panic == 0
+      assert db.scalar("SELECT DATABASE()").or_panic.nil?
+    end
+  end
+end
+
+# crystal-mysql's spec leaves the user it made on the server; the examples
+# above need it in turn, so it goes once they have all run.
+run_sql("DROP USER IF EXISTS crystal_test")

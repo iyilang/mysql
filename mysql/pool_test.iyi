@@ -1,0 +1,66 @@
+# crystal-mysql's spec/pool_spec.cr. crystal spawned free fibers and
+# counted them back with a channel; iyi's tasks live in a group, which
+# waits for all of them at its end.
+module mysql/pool_test
+
+import db/db/spec::{describe, it}
+import mysql/core
+import mysql/testing/spec_helper::{with_db}
+
+describe "DB::Pool" do
+  it "should write from multiple connections" do
+    fibers = 20
+    max_pool_size = 5
+    max_n = 50
+
+    with_db "crystal_mysql_test", "max_pool_size=#{max_pool_size}" do |db|
+      db.exec("create table numbers (n int, fiber int)").or_panic
+
+      group do |g|
+        fibers.times do |f|
+          g.spawn do
+            (1..max_n).each do |n|
+              db.exec("insert into numbers (n, fiber) values (?, ?)", n, f).or_panic
+              sleep 10
+            end
+            0
+          end
+        end
+      end
+
+      # all numbers were inserted
+      s = fibers * max_n * (max_n + 1) // 2
+      assert db.scalar("select sum(n) from numbers").or_panic == s
+
+      # numbers were not inserted one fiber at a time
+      rows = db.query_all("select n, fiber from numbers", as: Tuple(Int32, Int32)).or_panic
+      assert rows.map(&.[1]) != rows.map(&.[1]).sorted
+    end
+  end
+
+  it "starting multiple connections does not exceed max pool size" do
+    fibers = 100
+    max_pool_size = 5
+
+    with_db "crystal_mysql_test", "max_pool_size=#{max_pool_size}" do |db|
+      db.exec("create table numbers (n int, fiber int)").or_panic
+
+      max_open_connections = 0
+
+      group do |g|
+        fibers.times do
+          g.spawn do
+            cnn = db.checkout.or_panic
+            open = db.pool.stats.open_connections
+            max_open_connections = open if open > max_open_connections
+            sleep 10
+            cnn.release
+            0
+          end
+        end
+      end
+
+      assert max_open_connections <= max_pool_size
+    end
+  end
+end

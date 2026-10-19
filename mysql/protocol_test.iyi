@@ -1,0 +1,84 @@
+# crystal-mysql's spec/protocol_spec.cr, and the packets longer than one
+# frame that crystal-mysql did not read or write.
+#
+# crystal-mysql's spec wrote into an `IO::Memory` through a connection it
+# opened; a `WritePacket` and a `ReadPacket` over memory need none here.
+module mysql/protocol_test
+
+import std/slice::{Slice, Bytes}
+import db/db/spec::{describe, it}
+# Imported for its result sets: iyi-db's spec module, typed whole, needs a
+# `ResultSet` that is not abstract (iyi 0.18.0).
+import mysql/core
+import mysql/stream::{MemorySource}
+import mysql/packet::{ReadPacket, WritePacket, MAX_PACKET_LENGTH}
+
+# The frames of *packet*, numbered from 0, as one stream of bytes.
+def wire(packet : WritePacket) : Bytes
+  frames = packet.frames(0_u8)
+  size = frames.sum(&.size)
+  bytes = Bytes.new(size)
+  offset = 0
+  frames.each do |frame|
+    (bytes.to_unsafe + offset).copy_from(frame.to_unsafe, frame.size)
+    offset += frame.size
+  end
+  bytes
+end
+
+def reader(packet : WritePacket) : ReadPacket
+  ReadPacket.read(MemorySource.new(wire(packet))).or_panic
+end
+
+describe "MySql::Protocol" do
+  [42_u64, 250_u64, 251_u64, 1042_u64, 65_535_u64, 65_536_u64, 65_542_u64, 16_777_215_u64,
+   16_777_216_u64, 16_777_242_u64, 18446744073709551615_u64].each do |number|
+    it "should write/read LengthEncodedInteger: #{number}" do
+      writer = WritePacket.new
+      writer.write_lenenc_int(number)
+      assert reader(writer).read_lenenc_int.or_panic == number
+    end
+  end
+
+  it "writes and reads a payload of a frame and more" do
+    writer = WritePacket.new
+    blob = Bytes.new(MAX_PACKET_LENGTH + 10) { |i| (i % 251).to_u8 }
+    writer.write_blob(blob)
+    writer.write_lenenc_string("after")
+    frames = writer.frames(3_u8)
+    assert frames.size == 2
+    assert frames[0].size == 4 + MAX_PACKET_LENGTH
+    assert frames[0][3] == 3_u8
+    assert frames[1][3] == 4_u8
+
+    packet = reader(writer)
+    read = packet.read_blob.or_panic
+    assert read.size == blob.size
+    assert read[MAX_PACKET_LENGTH + 9] == blob[MAX_PACKET_LENGTH + 9]
+    assert read[MAX_PACKET_LENGTH - 1] == blob[MAX_PACKET_LENGTH - 1]
+    assert packet.read_lenenc_string.or_panic == "after"
+    assert packet.at_end?.or_panic
+    assert packet.seq == 1_u8
+  end
+
+  it "ends a payload of exactly a frame with an empty frame" do
+    writer = WritePacket.new
+    MAX_PACKET_LENGTH.times { writer.write_byte(7_u8) }
+    frames = writer.frames(0_u8)
+    assert frames.size == 2
+    assert frames[1].size == 4
+
+    packet = reader(writer)
+    packet.skip(MAX_PACKET_LENGTH - 1).or_panic
+    assert packet.read_byte.or_panic == 7_u8
+    assert packet.at_end?.or_panic
+  end
+
+  it "refuses to read past the payload" do
+    writer = WritePacket.new
+    writer.write_byte(1_u8)
+    packet = reader(writer)
+    assert packet.read_byte.or_panic == 1_u8
+    assert packet.read_byte.is_a?(Error)
+  end
+end

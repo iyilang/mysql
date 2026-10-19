@@ -1,0 +1,36 @@
+# crystal-mysql's spec/connection_spec.cr.
+module mysql/connection_test
+
+import db
+import db/db/spec::{describe, it}
+import mysql/core::{MySqlConnection}
+import mysql/testing/spec_helper::{db_url}
+
+describe "Connection" do
+  it "reports the driver name" do
+    ::Db.connect(db_url) do |cnn|
+      assert cnn.driver_name == "mysql"
+    end.or_panic
+  end
+
+  it "reports the server version from the handshake" do
+    ::Db.connect(db_url) do |cnn|
+      # MariaDB < 11 prefixes the handshake version with "5.5.5-", which `VERSION()` omits
+      assert (cnn.server_version || "").ends_with?(cnn.scalar("SELECT VERSION()").or_panic.as(String))
+    end.or_panic
+  end
+
+  it "reports the server name" do
+    ::Db.connect(db_url) do |cnn|
+      expected = cnn.scalar("SELECT VERSION()").or_panic.as(String).includes?("MariaDB") ? "MariaDB" : "MySQL"
+      assert cnn.server_name == expected
+    end.or_panic
+  end
+
+  it "reports the server's id for the session" do
+    ::Db.connect(db_url) do |cnn|
+      id = cnn.scalar("SELECT CONNECTION_ID()").or_panic
+      assert id == cnn.as(MySqlConnection).connection_id
+    end.or_panic
+  end
+end

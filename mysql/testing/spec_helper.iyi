@@ -1,0 +1,71 @@
+# What the tests share: crystal-mysql's `spec/spec_helper.cr`.
+#
+# The server is `DATABASE_URL`'s, `mysql://root@localhost` by default, as
+# crystal-mysql's `mysql://root@#{DATABASE_HOST}`: its user needs to
+# create and drop databases and users. Its query (`?ssl-mode=disabled`,
+# ...) is kept in every URL the tests make from it.
+module mysql/testing/spec_helper
+
+import std/env
+import std/text
+import std/uri::{URI, Params}
+import db
+import db/db/core::{Database}
+
+pub DATABASE_URL = ENV["DATABASE_URL"]? || "mysql://root@localhost"
+
+# The test server's URL, with *initial_db* as its `database` and the
+# parameters of *options* (`max_pool_size=5&...`) in its query.
+pub def db_url(initial_db : String? = nil, options : String? = nil) : String
+  uri = URI.parse(DATABASE_URL)
+  params = uri.query_params
+  if db = initial_db
+    params["database"] = db
+  end
+  if extra = options
+    Params.parse(extra).each { |key, value| params[key] = value }
+  end
+  uri.query = params.empty? ? nil : params.to_s
+  uri.to_s
+end
+
+# The test server's URL for *user* with *password*, with *initial_db* as
+# its `database`.
+pub def db_url_as(user : String, password : String, initial_db : String? = nil, options : String? = nil) : String
+  uri = URI.parse(db_url(initial_db, options))
+  uri.user = user
+  uri.password = password
+  uri.to_s
+end
+
+# The host the tests connect to, a Unix socket's path when there is none.
+pub def database_host : String
+  uri = URI.parse(DATABASE_URL)
+  host = uri.hostname
+  host && !host.empty? ? host : uri.path
+end
+
+# Opens the server's `crystal_mysql_test` database, created empty, with
+# *options* in the URL's query, and drops it after.
+pub def with_db(database_name : String?, options : String? = nil, & : Database -> Nil) : Nil
+  run_sql("DROP DATABASE IF EXISTS crystal_mysql_test", "CREATE DATABASE crystal_mysql_test")
+  defer run_sql("DROP DATABASE IF EXISTS crystal_mysql_test")
+
+  ::Db.open(db_url(database_name, options)) { |db| yield db }.or_panic
+end
+
+# Runs each of *statements* on the test server, as its user, panicking on
+# a failure.
+pub def run_sql(*statements : String) : Nil
+  ::Db.open(db_url) do |db|
+    statements.each { |sql| db.exec(sql).or_panic }
+  end.or_panic
+end
+
+# The server's version: some docker images might report
+# 5.7.30-0ubuntu0.18.04.1, so it is split at "-".
+pub def mysql_version(db : Database) : {Int32, Int32, Int32}
+  text = db.scalar("SELECT VERSION();").or_panic.as(String).split('-').first
+  parts = text.split('.').map { |part| part.to_i? || 0 }
+  {parts[0]? || 0, parts[1]? || 0, parts[2]? || 0}
+end

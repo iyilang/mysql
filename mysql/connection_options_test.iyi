@@ -1,0 +1,136 @@
+# crystal-mysql's spec/connection_options_spec.cr.
+module mysql/connection_options_test
+
+import std/path::{Path}
+import std/uri::{URI, Params}
+import db/db/errors::*
+import db/db/spec::{describe, it, expect_error}
+import mysql/options::{Options, SSLOptions, SSLMode}
+# Imported for its result sets: iyi-db's spec module, typed whole, needs a
+# `ResultSet` that is not abstract (iyi 0.18.0).
+import mysql/core
+import mysql/collations::{default_collation}
+
+def from_uri(uri : String) : Options
+  Options.from_uri(URI.parse(uri)).or_panic
+end
+
+def tcp(host : String, port : Int32) : URI
+  URI.new("tcp", host, port)
+end
+
+def socket(path : String) : URI
+  URI.new("unix", nil, nil, path)
+end
+
+def ssl_from_params(params : String) : SSLOptions
+  SSLOptions.from_params(Params.parse(params)).or_panic
+end
+
+SSL_OPTION_PREFERRED = SSLOptions.new(mode: SSLMode::Preferred)
+
+def options(transport : URI, username : String?, password : String?, initial_catalog : String?, charset : String = default_collation) : Options
+  Options.new(
+    transport: transport,
+    username: username,
+    password: password,
+    initial_catalog: initial_catalog,
+    charset: charset,
+    ssl_options: SSL_OPTION_PREFERRED
+  )
+end
+
+describe "Connection::Options.from_uri" do
+  it "parses mysql://user@host/db" do
+    assert from_uri("mysql://root@localhost/test") == options(tcp("localhost", 3306), "root", nil, "test")
+  end
+
+  it "parses mysql://host" do
+    assert from_uri("mysql://localhost") == options(tcp("localhost", 3306), nil, nil, nil)
+  end
+
+  it "parses mysql://host:port" do
+    assert from_uri("mysql://localhost:1234") == options(tcp("localhost", 1234), nil, nil, nil)
+  end
+
+  it "parses ?encoding=..." do
+    assert from_uri("mysql://localhost:1234?encoding=utf8mb4_unicode_520_ci") ==
+           options(tcp("localhost", 1234), nil, nil, nil, "utf8mb4_unicode_520_ci")
+  end
+
+  it "parses mysql://user@host?database=db" do
+    assert from_uri("mysql://root@localhost?database=test") == options(tcp("localhost", 3306), "root", nil, "test")
+  end
+
+  it "parses mysql:///path/to/socket" do
+    assert from_uri("mysql:///path/to/socket") == options(socket("/path/to/socket"), nil, nil, nil)
+  end
+
+  it "parses mysql:///path/to/socket?database=test" do
+    assert from_uri("mysql:///path/to/socket?database=test") == options(socket("/path/to/socket"), nil, nil, "test")
+  end
+
+  it "parses mysql:///path/to/socket?encoding=utf8mb4_unicode_520_ci" do
+    assert from_uri("mysql:///path/to/socket?encoding=utf8mb4_unicode_520_ci") ==
+           options(socket("/path/to/socket"), nil, nil, nil, "utf8mb4_unicode_520_ci")
+  end
+
+  it "parses mysql://user:pass@/path/to/socket?database=test" do
+    assert from_uri("mysql://root:password@/path/to/socket?database=test") ==
+           options(socket("/path/to/socket"), "root", "password", "test")
+  end
+
+  it "refuses an encoding that is no collation" do
+    expect_error(Options.from_uri(URI.parse("mysql://localhost?encoding=klingon")), ArgumentError,
+      "Unknown collation \"klingon\" in encoding", partial: true)
+  end
+end
+
+describe "Connection::SSLOptions.from_params" do
+  it "default is ssl-mode=preferred" do
+    assert ssl_from_params("").mode == SSLMode::Preferred
+  end
+
+  it "parses ssl-mode=preferred" do
+    assert ssl_from_params("ssl-mode=preferred").mode == SSLMode::Preferred
+    assert ssl_from_params("ssl-mode=Preferred").mode == SSLMode::Preferred
+    assert ssl_from_params("ssl-mode=PREFERRED").mode == SSLMode::Preferred
+  end
+
+  it "parses ssl-mode=disabled" do
+    assert ssl_from_params("ssl-mode=disabled").mode == SSLMode::Disabled
+    assert ssl_from_params("ssl-mode=Disabled").mode == SSLMode::Disabled
+    assert ssl_from_params("ssl-mode=DISABLED").mode == SSLMode::Disabled
+  end
+
+  it "parses ssl-mode=verifyca" do
+    assert ssl_from_params("ssl-mode=verifyca").mode == SSLMode::VerifyCA
+    assert ssl_from_params("ssl-mode=verify-ca").mode == SSLMode::VerifyCA
+    assert ssl_from_params("ssl-mode=verify_ca").mode == SSLMode::VerifyCA
+    assert ssl_from_params("ssl-mode=VERIFY_CA").mode == SSLMode::VerifyCA
+  end
+
+  it "parses ssl-mode=verifyidentity" do
+    assert ssl_from_params("ssl-mode=verifyidentity").mode == SSLMode::VerifyIdentity
+    assert ssl_from_params("ssl-mode=verify-identity").mode == SSLMode::VerifyIdentity
+    assert ssl_from_params("ssl-mode=verify_identity").mode == SSLMode::VerifyIdentity
+    assert ssl_from_params("ssl-mode=VERIFY_IDENTITY").mode == SSLMode::VerifyIdentity
+  end
+
+  it "refuses an ssl-mode that is none" do
+    expect_error(SSLOptions.from_params(Params.parse("ssl-mode=sometimes")), ArgumentError,
+      "Unknown ssl-mode \"sometimes\"", partial: true)
+  end
+
+  it "parses ssl-key, ssl-cert, ssl-ca" do
+    assert ssl_from_params("ssl-key=path/to/key.pem&ssl-cert=path/to/cert.pem&ssl-ca=path/to/ca.pem") ==
+           SSLOptions.new(mode: SSLMode::Preferred,
+             key: Path["path/to/key.pem"].expand(home: true),
+             cert: Path["path/to/cert.pem"].expand(home: true),
+             ca: Path["path/to/ca.pem"].expand(home: true))
+  end
+
+  it "missing ssl-key, ssl-cert, ssl-ca as nil" do
+    assert ssl_from_params("") == SSLOptions.new(mode: SSLMode::Preferred, key: nil, cert: nil, ca: nil)
+  end
+end
