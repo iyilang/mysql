@@ -1,0 +1,495 @@
+# The driver: crystal-mysql's `MySql::Driver`, `MySql::Connection`,
+# `MySql::Statement`, `MySql::UnpreparedStatement`, `MySql::ResultSet` and
+# `MySql::TextResultSet`, the classes iyi-db's `Driver`, `Connection`,
+# `Statement` and `ResultSet` are subclassed by. They refer to one another,
+# and an import graph has no cycles (R-1), so they live in one module, as
+# iyi-db's own do.
+#
+# The names carry a `MySql` prefix because this module imports iyi-db's
+# `Connection`, `Statement` and `ResultSet` by those names.
+module mysql/core
+
+import std/int
+import std/uri::{URI, Params}
+import std/uuid::{UUID}
+import std/slice::{Slice, Bytes}
+import db
+import db/db/errors::*
+import db/db/value::{DBValue, ExecResult}
+import db/db/core::{Driver, ConnectionBuilder, ResultSet, Statement, Connection, ConnectionLost}
+import mysql/errors::{StreamError, PacketError}
+import mysql/packet::{ReadPacket, WritePacket}
+import mysql/options::{Options}
+import mysql/types::*
+import mysql/session::{Session, OkPacket, PreparedStatementInfo}
+
+# What the two result sets share: the columns, moving from row to row,
+# and the typed reads crystal-mysql had on both.
+pub abstract class MySqlBaseResultSet < ResultSet
+  getter columns : Array(ColumnSpec)
+  @session : Session
+  @row_packet : ReadPacket? = nil
+  # The next column index to return.
+  @column_index = 0
+  @eof_reached = false
+
+  def initialize(statement : Statement, @session : Session, @columns : Array(ColumnSpec), *, empty : Bool = false)
+    super(statement)
+    @eof_reached = empty
+  end
+
+  def move_next : Bool | DBError
+    result = advance
+    if result.is_a?(DBError)
+      @eof_reached = true
+      return MySqlBaseResultSet.lost(statement.connection, result)
+    end
+    result
+  end
+
+  private def advance : Bool | DBError
+    return false if @eof_reached
+
+    # skips the previous row, what was not read of it
+    row_packet = @session.read_packet!
+    @row_packet = row_packet
+
+    header = row_packet.read_byte!
+    if header == 0xFE_u8 && row_packet.length < 9 # EOF
+      @eof_reached = true
+      return false
+    end
+    # the server failed while sending the rows
+    return @session.handle_err_packet(row_packet) if header == 0xFF_u8
+
+    @column_index = 0
+    start_row(row_packet, header)!
+    true
+  end
+
+  # Reads what a row holds before its first column, *header* its first
+  # byte.
+  protected abstract def start_row(packet : ReadPacket, header : UInt8) : Nil | DBError
+
+  # Reads the value of *column* in the row, at *packet*'s position; nil
+  # for NULL.
+  protected abstract def read_column(packet : ReadPacket, index : Int32, column : ColumnSpec) : DBValue | DBError
+
+  def column_count : Int32
+    @columns.size
+  end
+
+  def column_name(index : Int32) : String
+    @columns[index].name
+  end
+
+  def next_column_index : Int32
+    @column_index
+  end
+
+  def read : DBValue | DBError
+    row_packet = @row_packet
+    return DBError.new("no row to read: call move_next first") if row_packet.nil?
+    col = @column_index
+    return DBError.new("column #{col} is past the last of the row's #{@columns.size}") if col >= @columns.size
+    @column_index += 1
+    value = read_column(row_packet, col, @columns[col])
+    return MySqlBaseResultSet.lost(statement.connection, value) if value.is_a?(DBError)
+    value
+  end
+
+  def read(t : UUID.class) : UUID | DBError
+    index = @column_index
+    value = read(UUID | Nil)!
+    return mismatch(index, nil, "UUID") if value.nil?
+    value
+  end
+
+  # A `BINARY(16)` or `BLOB` column holding a UUID's 16 bytes: a column of
+  # another type is refused, as one holding another number of bytes.
+  def read(t : (UUID | Nil).class) : UUID | Nil | DBError
+    index = @column_index
+    value = read!
+    return nil if value.nil?
+    column = @columns[index]
+    # Check if binary flag is set
+    # https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__column__definition__flags.html#gaf74577f0e38eed5616a090965aeac323
+    if column.binary_flag?
+      case value
+      when Bytes  then return uuid_from(value)
+      when String then return uuid_from(string_bytes(value))
+      end
+    end
+    DBError.new("The column #{column.name} of type #{column.type_name} returns a #{value.class} and can't be read as UUID")
+  end
+
+  def read(t : UUIDValue.class) : UUIDValue | DBError
+    UUIDValue.new(read(UUID)!)
+  end
+
+  def read(t : (UUIDValue | Nil).class) : UUIDValue | Nil | DBError
+    uuid = read(UUID | Nil)!
+    uuid.nil? ? nil : UUIDValue.new(uuid)
+  end
+
+  # An integer column as a `Bool`: crystal-mysql's `MySql::Type.from_mysql`,
+  # so a `BOOL` (`TINYINT(1)`) and `EXISTS(...)` read as one.
+  def read(t : Bool.class) : Bool | DBError
+    index = @column_index
+    value = read(Bool | Nil)!
+    return mismatch(index, nil, "Bool") if value.nil?
+    value
+  end
+
+  def read(t : (Bool | Nil).class) : Bool | Nil | DBError
+    index = @column_index
+    value = read!
+    case value
+    when Nil    then nil
+    when Bool   then value
+    when Int8   then value != 0
+    when Int16  then value != 0
+    when Int32  then value != 0
+    when Int64  then value != 0
+    when UInt8  then value != 0
+    when UInt16 then value != 0
+    when UInt32 then value != 0
+    when UInt64 then value != 0
+    else
+      mismatch(index, value, "(Bool | Nil)")
+    end
+  end
+
+  def read(klass : T.class) : T | DBError forall T
+    super
+  end
+
+  private def mismatch(index : Int32, value : DBValue, expected : String) : DBError
+    ColumnTypeMismatchError.new(
+      context: "#{self.class}#read",
+      column_index: index,
+      column_name: column_name(index),
+      column_type: value.class.to_s,
+      expected_type: expected
+    )
+  end
+
+  # Reads the rows left, so the session can run its next command.
+  def drain : Nil | DBError
+    while move_next!
+    end
+    nil
+  end
+
+  protected def do_close : Nil | DBError
+    drained = drain
+    # Release the connection only after the remaining rows were skipped,
+    # otherwise another task could check it out and read them. A lost
+    # connection has nothing left to drain.
+    released = super
+    return drained if drained.is_a?(DBError) && !drained.is_a?(ConnectionLost)
+    released
+  end
+
+  # *error* as a statement answers it: `ConnectionLost`, which closes the
+  # connection so the pool does not hand it out again, when the socket
+  # failed or the server said the session is gone; the error itself
+  # otherwise.
+  def self.lost(connection : Connection, error : DBError) : DBError
+    return error if error.is_a?(ConnectionLost)
+    if error.is_a?(StreamError) || (error.is_a?(PacketError) && error.lost_connection?)
+      return ConnectionLost.new(connection, error)
+    end
+    error
+  end
+
+  # What COM_STMT_EXECUTE and COM_QUERY answer: an OK packet, or the
+  # columns of the rows that follow, in the text protocol when *text*.
+  def self.read_response(statement : Statement, session : Session, text : Bool) : ExecResult | MySqlBaseResultSet | DBError
+    packet = session.read_packet!
+    header = packet.read_byte!
+    case header
+    when 0xFF_u8 # err packet
+      session.handle_err_packet(packet)
+    when 0x00_u8 # ok packet
+      ok = OkPacket.read(packet)!
+      ExecResult.new(ok.affected_rows, ok.last_insert_id)
+    when 0xFB_u8
+      DBError.new("The server asked for a LOCAL INFILE, which this driver does not send")
+    else
+      column_count = packet.read_lenenc_int(header)!
+      columns = session.read_column_definitions(column_count.to_i32)!
+      if text
+        MySqlTextResultSet.new(statement, session, columns)
+      else
+        MySqlResultSet.new(statement, session, columns)
+      end
+    end
+  end
+
+  # A query answers its rows; a statement that has none answers a result
+  # set that is already at its end.
+  def self.as_result_set(statement : Statement, session : Session, result : ExecResult | MySqlBaseResultSet, text : Bool) : ResultSet
+    case result
+    when MySqlBaseResultSet
+      result
+    else
+      if text
+        MySqlTextResultSet.new(statement, session, [] of ColumnSpec, empty: true)
+      else
+        MySqlResultSet.new(statement, session, [] of ColumnSpec, empty: true)
+      end
+    end
+  end
+
+  # An exec answers its counts; a statement that has rows has them read
+  # and answers zeros, where crystal-mysql's cast to `ExecResult` raised.
+  def self.as_exec_result(result : ExecResult | MySqlBaseResultSet) : ExecResult | DBError
+    case result
+    when MySqlBaseResultSet
+      result.drain!
+      ExecResult.new(0_i64, 0_i64)
+    else
+      result
+    end
+  end
+end
+
+# The rows of a prepared statement, in the binary protocol.
+#
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_binary_resultset.html
+pub class MySqlResultSet < MySqlBaseResultSet
+  @null_bitmap : Bytes
+
+  def initialize(statement : Statement, session : Session, columns : Array(ColumnSpec), *, empty : Bool = false)
+    super(statement, session, columns, empty: empty)
+    @null_bitmap = Bytes.new((columns.size + 2 + 7) // 8)
+  end
+
+  protected def start_row(packet : ReadPacket, header : UInt8) : Nil | DBError
+    packet.read_fully(@null_bitmap)
+  end
+
+  protected def read_column(packet : ReadPacket, index : Int32, column : ColumnSpec) : DBValue | DBError
+    bit = index + 2
+    return nil if (@null_bitmap[bit // 8] >> (bit % 8)) & 1_u8 == 1_u8
+    read_binary(packet, column)
+  end
+end
+
+# The rows of an unprepared statement, in the text protocol: each column a
+# length-encoded string, or 0xFB for NULL.
+#
+# https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html
+pub class MySqlTextResultSet < MySqlBaseResultSet
+  # The first byte of the row, which is its first column's.
+  @first_byte = 0_u8
+  @first_row_packet = false
+
+  def initialize(statement : Statement, session : Session, columns : Array(ColumnSpec), *, empty : Bool = false)
+    super(statement, session, columns, empty: empty)
+  end
+
+  protected def start_row(packet : ReadPacket, header : UInt8) : Nil | DBError
+    @first_byte = header
+    @first_row_packet = true
+    nil
+  end
+
+  protected def read_column(packet : ReadPacket, index : Int32, column : ColumnSpec) : DBValue | DBError
+    if @first_row_packet
+      current_byte = @first_byte
+      @first_row_packet = false
+    else
+      current_byte = packet.read_byte!
+    end
+    return nil if current_byte == 0xFB_u8
+    length = packet.read_lenenc_int(current_byte)!
+    return StreamError.new("Malformed row: a value of #{length} bytes") if length > 2147483647_u64
+    parse_text(packet.read_string(length.to_i32)!, column)
+  end
+end
+
+# A statement prepared on the server (COM_STMT_PREPARE), executed in the
+# binary protocol, and closed there (COM_STMT_CLOSE) when it is closed:
+# crystal-mysql's statements stayed on the server until the connection
+# closed.
+pub class MySqlStatement < Statement
+  getter statement_id : Int32
+  getter params : Array(ColumnSpec)
+  getter columns : Array(ColumnSpec)
+
+  def initialize(connection : Connection, @session : Session, command : String, info : PreparedStatementInfo)
+    super(connection, command)
+    @statement_id = info.statement_id
+    @params = info.params
+    @columns = info.columns
+  end
+
+  # Prepares *command* on the server.
+  def self.prepare(connection : Connection, session : Session, command : String) : MySqlStatement | DBError
+    info = session.prepare(command)
+    return MySqlBaseResultSet.lost(connection, info) if info.is_a?(DBError)
+    MySqlStatement.new(connection, session, command, info)
+  end
+
+  protected def perform_query(args : Array(DBValue)) : ResultSet | DBError
+    result = perform_exec_or_query(args)
+    return MySqlBaseResultSet.lost(connection, result) if result.is_a?(DBError)
+    MySqlBaseResultSet.as_result_set(self, @session, result, false)
+  end
+
+  protected def perform_exec(args : Array(DBValue)) : ExecResult | DBError
+    result = perform_exec_or_query(args)
+    result = MySqlBaseResultSet.as_exec_result(result) unless result.is_a?(DBError)
+    return MySqlBaseResultSet.lost(connection, result) if result.is_a?(DBError)
+    result
+  end
+
+  # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
+  private def perform_exec_or_query(args : Array(DBValue)) : ExecResult | MySqlBaseResultSet | DBError
+    if args.size != @params.size
+      return DBError.new("The statement takes #{@params.size} parameters, #{args.size} were given")
+    end
+    packet = WritePacket.new
+    packet.write_byte(Session::COM_STMT_EXECUTE)
+    packet.write_u32(@statement_id.unsafe_to_u32)
+    packet.write_byte(0x00_u8) # flags: CURSOR_TYPE_NO_CURSOR
+    packet.write_u32(1_u32)    # iteration count
+
+    if @params.size > 0
+      null_bitmap = Bytes.new((@params.size + 7) // 8)
+      args.each_with_index do |arg, index|
+        next unless arg.nil?
+        null_bitmap[index // 8] |= (1_u8 << (index % 8))
+      end
+      packet.write(null_bitmap)
+
+      packet.write_byte(0x01_u8) # new-params-bound
+
+      # params types
+      args.each do |arg|
+        type = param_type(arg)!
+        packet.write_byte(type[0])
+        packet.write_byte(type[1] ? 0x80_u8 : 0x00_u8)
+      end
+
+      # params values
+      args.each do |arg|
+        next if arg.nil?
+        write_param(packet, arg)!
+      end
+    end
+
+    @session.write_packet(0_u8, packet)!
+    MySqlBaseResultSet.read_response(self, @session, false)
+  end
+
+  protected def do_close : Nil | DBError
+    # a session that is gone took its statements with it
+    @session.close_statement(@statement_id) unless @session.closed?
+    super
+  end
+end
+
+# A statement sent as text (COM_QUERY), its rows in the text protocol.
+# Arguments are refused, as crystal-mysql refused them: they would have to
+# be written into the query.
+pub class MySqlUnpreparedStatement < Statement
+  def initialize(connection : Connection, @session : Session, command : String)
+    super(connection, command)
+  end
+
+  protected def perform_query(args : Array(DBValue)) : ResultSet | DBError
+    result = perform_exec_or_query(args)
+    return MySqlBaseResultSet.lost(connection, result) if result.is_a?(DBError)
+    MySqlBaseResultSet.as_result_set(self, @session, result, true)
+  end
+
+  protected def perform_exec(args : Array(DBValue)) : ExecResult | DBError
+    result = perform_exec_or_query(args)
+    result = MySqlBaseResultSet.as_exec_result(result) unless result.is_a?(DBError)
+    return MySqlBaseResultSet.lost(connection, result) if result.is_a?(DBError)
+    result
+  end
+
+  # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query.html
+  private def perform_exec_or_query(args : Array(DBValue)) : ExecResult | MySqlBaseResultSet | DBError
+    return DBError.new("exec/query with args is not supported") if args.size > 0
+    @session.write_command(Session::COM_QUERY, command)!
+    MySqlBaseResultSet.read_response(self, @session, true)
+  end
+end
+
+pub class MySqlConnection < Connection
+  # The protocol session under this connection.
+  getter session : Session
+
+  def initialize(options : Connection::Options, @session : Session)
+    super(options)
+  end
+
+  # Opens the session *mysql_options* describes; `ConnectionRefused`, with
+  # the reason as its cause, when it cannot be established.
+  def self.open(options : Connection::Options, mysql_options : ::Mysql::Options::Options) : MySqlConnection | DBError
+    session = Session.establish(mysql_options)
+    return ConnectionRefused.new(session.message, session) if session.is_a?(DBError)
+    MySqlConnection.new(options, session)
+  end
+
+  def build_prepared_statement(query : String) : Statement | DBError
+    MySqlStatement.prepare(self, @session, query)
+  end
+
+  def build_unprepared_statement(query : String) : Statement | DBError
+    MySqlUnpreparedStatement.new(self, @session, query)
+  end
+
+  # :inherit:
+  def driver_name : String
+    "mysql"
+  end
+
+  # :inherit:
+  #
+  # MariaDB reports a version containing `MariaDB` (e.g.
+  # `"12.2.2-MariaDB-ubu2404"`), MySQL doesn't.
+  def server_name : String?
+    @session.server_version.includes?("MariaDB") ? "MariaDB" : "MySQL"
+  end
+
+  # :inherit:
+  def server_version : String?
+    @session.server_version
+  end
+
+  # The server's id for this session: what `CONNECTION_ID()` answers, and
+  # what `KILL` takes.
+  def connection_id : Int32
+    @session.connection_id
+  end
+
+  protected def do_close : Nil | DBError
+    closed = super
+    @session.close
+    closed
+  end
+end
+
+pub class MySqlConnectionBuilder < ConnectionBuilder
+  def initialize(@options : Connection::Options, @mysql_options : Options)
+  end
+
+  def build : Connection | DBError
+    MySqlConnection.open(@options, @mysql_options)
+  end
+end
+
+pub class MySqlDriver < Driver
+  def connection_builder(uri : URI) : ConnectionBuilder | DBError
+    params = Params.parse(uri.query || "")
+    MySqlConnectionBuilder.new(connection_options(params)!, Options.from_uri(uri)!)
+  end
+end
+
+::Db.register_driver "mysql", MySqlDriver

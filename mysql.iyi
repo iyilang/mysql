@@ -1,0 +1,18 @@
+# The MySQL driver for iyi-db: a port of crystal-mysql
+# (https://github.com/crystal-lang/crystal-mysql) 0.18.0, written in iyi.
+#
+# Importing this module registers the driver for `mysql://` URIs:
+#
+# ```
+# import db
+# import mysql
+#
+# Db.open("mysql://user:pass@localhost/mydb") do |db|
+#   puts db.scalar("select 1")!
+# end
+# ```
+module mysql
+
+pub import mysql/core
+
+pub VERSION = "0.1.0"
