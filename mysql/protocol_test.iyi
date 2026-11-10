@@ -20,7 +20,7 @@ def wire(packet : WritePacket) : Bytes
   bytes = Bytes.new(size)
   offset = 0
   frames.each do |frame|
-    (bytes.to_unsafe + offset).copy_from(frame.to_unsafe, frame.size)
+    bytes[offset, frame.size].copy_from(frame)
     offset += frame.size
   end
   bytes

@@ -33,6 +33,7 @@ pub CACHING_SHA2_PASSWORD = "caching_sha2_password"
 pub SHA256_PASSWORD       = "sha256_password"
 
 # The plugins this driver answers a server with.
+@[SafeReach("built in its initializer and only read")]
 pub SUPPORTED_PLUGINS = [NATIVE_PASSWORD, CACHING_SHA2_PASSWORD, SHA256_PASSWORD]
 
 # What the client sends *plugin* first, *nonce* the server's 20 bytes and

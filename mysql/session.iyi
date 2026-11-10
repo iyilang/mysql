@@ -350,7 +350,7 @@ pub class Session
         # AuthMoreData
         data = packet.read_rest!
         if awaiting_key
-          pem = String.new(data.size) { |buffer| buffer.copy_from(data.to_unsafe, data.size) }
+          pem = String.new(data)
           encrypted = rsa_encrypt_password(pem, password, nonce)!
           write_packet(next_seq(packet), packet_of(encrypted))!
           awaiting_key = false

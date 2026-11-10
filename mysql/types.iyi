@@ -19,6 +19,7 @@
 #
 # https://dev.mysql.com/doc/dev/mysql-server/latest/field__types_8h.html
 # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_binary_resultset.html
+@[Unsafe("reads and writes a FLOAT or DOUBLE by reinterpreting the bits of a local through a pointer to it")]
 module mysql/types
 
 import std/int
@@ -147,7 +148,7 @@ pub def uuid_from(bytes : Bytes) : UUID | DBError
 end
 
 pub def bytes_string(bytes : Bytes) : String
-  String.new(bytes.size) { |buffer| buffer.copy_from(bytes.to_unsafe, bytes.size) }
+  String.new(bytes)
 end
 
 # The float whose IEEE 754 bits are *bits*, and back. Each its own def, so
@@ -170,7 +171,7 @@ end
 
 pub def string_bytes(text : String) : Bytes
   slice = Bytes.new(text.bytesize)
-  slice.to_unsafe.copy_from(text.to_unsafe, text.bytesize)
+  slice.copy_from(Bytes.of(text))
   slice
 end
 
@@ -314,9 +315,8 @@ end
 def digits(text : String, start : Int32, count : Int32) : Int32?
   return nil if start + count > text.bytesize
   value = 0
-  p = text.to_unsafe
   count.times do |i|
-    c = p[start + i].to_i32
+    c = text.byte_at(start + i).to_i32
     return nil if c < 48 || c > 57
     value = value * 10 + (c - 48)
   end
@@ -327,13 +327,12 @@ end
 # included: 0 when there is none, nil when it is not digits.
 def fraction(text : String, start : Int32) : Int32?
   return 0 if start >= text.bytesize
-  p = text.to_unsafe
-  return nil unless p[start] == 46_u8
+  return nil unless text.byte_at(start) == 46_u8
   value = 0
   scale = 0
   i = start + 1
   while i < text.bytesize
-    c = p[i].to_i32
+    c = text.byte_at(i).to_i32
     return nil if c < 48 || c > 57
     if scale < 6
       value = value * 10 + (c - 48)
@@ -350,7 +349,7 @@ end
 
 # The byte of *text* at *index*, 0 past its end.
 def byte_at(text : String, index : Int32) : UInt8
-  index < text.bytesize ? text.to_unsafe[index] : 0_u8
+  index < text.bytesize ? text.byte_at(index) : 0_u8
 end
 
 # A `DATE`, `DATETIME` or `TIMESTAMP` from its text: `2016-02-15`,

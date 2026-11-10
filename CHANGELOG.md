@@ -1,3 +1,27 @@
+## Unreleased
+
+Requires iyi 0.21.0 and iyi-db 0.5.0. iyi 0.21.0 refuses an operation on
+raw memory in a module that is not marked `@[Unsafe("why")]` (SPEC.md
+III.13), and 0.20.x refuses the mark above a `module` header, so no source
+of this driver compiles on both. 0.21.0 refuses iyi-db 0.3.0 too.
+
+* The three modules that handle raw memory say so, each with why:
+  `mysql/stream` (the socket's read and write buffers), `mysql/packet`
+  (a read into the caller's buffer or a new string's, and the payload
+  buffer a write copies into) and `mysql/types` (a `FLOAT` or `DOUBLE`
+  read and written by reinterpreting its bits).
+* `mysql/session` and the rest of `mysql/types` no longer touch raw
+  memory: a string is made from bytes with `String.new(bytes)` and a
+  string's bytes are read through `Bytes.of` or `byte_at`, so the
+  compiler checks them. `protocol_test` copies frames slice to slice.
+* iyi-db 0.4.0's `Database` and `Pool` are `Share`: one kept in a constant
+  may be used by parallel tasks on every worker. The block a `Database`
+  opens connections with runs on any worker, so `SUPPORTED_PLUGINS`,
+  `COLLATIONS_IDS_BY_NAME` and `PacketError::LOST_CONNECTION_CODES`, which
+  it reaches, are marked `@[SafeReach]`, a claim the compiler proves
+  (SPEC.md III.4.4): a program that opens a MySQL database builds without
+  the reach warning.
+
 ## v0.1.0
 
 The first release of iyi-mysql: crystal-mysql 0.18.0 ported to iyi, in iyi,

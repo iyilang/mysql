@@ -6,6 +6,7 @@
 #
 # Every read answers `StreamError` when the bytes asked for are not there:
 # the socket failed, or the source ended first.
+@[Unsafe("the socket's reads and writes go through read and write buffers it indexes by pointer, copying bytes between them and the pointer a read fills or a write sends")]
 module mysql/stream
 
 import std/socket::{IyiSocket, SocketError}
