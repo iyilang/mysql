@@ -1,3 +1,11 @@
+## Unreleased
+
+* The note that a debug build's TLS handshake overruns a task's stack in
+  iyi 0.18.0 is gone from the README, and CI runs the TLS tests with
+  `iyi test` in debug builds instead of one `--release` build per test:
+  [iyi#130](https://github.com/iyilang/iyi/issues/130) has been fixed
+  since 2026-10-22, before the iyi 0.21.0 this driver requires.
+
 ## v0.2.0
 
 Requires iyi 0.21.0 and iyi-db 0.5.0. iyi 0.21.0 refuses an operation on

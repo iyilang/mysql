@@ -143,14 +143,6 @@ A server that asks for a client certificate is sent the one in `ssl-cert` and
 `ssl-key`: PEM, the key Ed25519, P-256 or RSA, unencrypted. TLS 1.3 is spoken,
 and 1.2 with a server that has nothing newer.
 
-In iyi 0.18.0, a handshake run as a task in a debug build can overrun the
-task's 256 KiB stack - the certificate's checks take most of it in a debug
-build, with an RSA certificate as with an ECDSA one - and the program dies of a
-memory fault or reads a certificate as untrusted
-([iyi#130](https://github.com/iyilang/iyi/issues/130)). A pool opens its
-connections in the task that checks them out. A `--release` build, or the
-handshake on the main fiber, is not affected.
-
 #### Authentication
 
 The server's authentication plugin for the user is answered, switching to it
@@ -256,11 +248,11 @@ test users. The TLS tests, and the driver's "connect with ssl", run when
 `SSL_CA` names the CA of a server certificate for the test host, and the client
 certificate test when `SSL_CLIENT_CERT` and `SSL_CLIENT_KEY` name a
 certificate for `CN=iyi_client` and its key; `.github/workflows/ci.yml` makes
-them. Run the suite over TLS from `--release` builds (see TLS above):
+them. Run the suite over TLS:
 
 ```sh
 export DATABASE_URL="mysql://root:password@127.0.0.1?ssl-mode=verify_identity&ssl-ca=$SSL_CA"
-for test in mysql/*_test.iyi; do iyi build --release "$test" -o bin/test && bin/test; done
+iyi test mysql
 ```
 
 ## Contributors
