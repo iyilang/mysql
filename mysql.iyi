@@ -15,4 +15,4 @@ module mysql
 
 pub import mysql/core
 
-pub VERSION = "0.1.0"
+pub VERSION = "0.2.0"
