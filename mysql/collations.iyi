@@ -12,6 +12,7 @@
 # https://dev.mysql.com/doc/refman/8.0/en/charset-connection.html#charset-connection-impermissible-client-charset
 module mysql/collations
 
+@[SafeReach("built in its initializer and only read")]
 pub COLLATIONS_IDS_BY_NAME = {
   "big5_chinese_ci"             => 1,
   "latin2_czech_cs"             => 2,

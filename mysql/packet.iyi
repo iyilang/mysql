@@ -9,6 +9,7 @@
 #
 # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_packets.html
 # https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_dt_integers.html
+@[Unsafe("a read fills the caller's buffer or a new string's through a pointer to it, and a write copies bytes by pointer into the payload buffer and the frames cut from it")]
 module mysql/packet
 
 import std/int

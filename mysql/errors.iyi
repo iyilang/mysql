@@ -35,6 +35,7 @@ pub class PacketError < DBError
   #
   # https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html
   # https://dev.mysql.com/doc/mysql-errors/8.0/en/client-error-reference.html
+  @[SafeReach("built in its initializer and only read")]
   LOST_CONNECTION_CODES = [1053, 1152, 1927, 2006, 2013]
 
   def initialize(message : String, @code : Int32 = 0, @sql_state : String = "")
