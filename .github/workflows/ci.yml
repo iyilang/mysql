@@ -33,10 +33,8 @@ jobs:
 
       - run: iyi version
 
-      # Without TLS: db/db/spec runs its examples as tasks, whose 256 KiB
-      # stack a debug build's handshake overruns in iyi 0.18.0
-      # (iyilang/iyi#130), and `ssl-mode=preferred` would try one against
-      # the server's auto-generated certificate.
+      # Without TLS: `ssl-mode=preferred` would try a handshake against the
+      # server's auto-generated certificate, which names no host.
       - name: Test
         env:
           DATABASE_URL: mysql://root:password@127.0.0.1?ssl-mode=disabled
@@ -79,16 +77,12 @@ jobs:
             echo "SSL_CLIENT_KEY=$dir/client.key"
           } >> "$GITHUB_ENV"
 
-      # Over TLS, every test built with --release, whose handshake fits a
-      # task's stack (iyilang/iyi#130).
+      # Over TLS, the same debug builds `iyi test` makes: a handshake run as
+      # a task fits its stack since iyi#130 was fixed.
       - name: Test over TLS
         run: |
           export DATABASE_URL="mysql://root:password@127.0.0.1?ssl-mode=verify_identity&ssl-ca=$SSL_CA"
-          for test in mysql/*_test.iyi; do
-            echo "running $test"
-            iyi build --release "$test" -o "$RUNNER_TEMP/test"
-            "$RUNNER_TEMP/test"
-          done
+          iyi test mysql
 
       - name: Check formatting
         run: iyi fmt --check mysql.iyi mysql
