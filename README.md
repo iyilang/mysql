@@ -15,7 +15,8 @@ structured. It also connects to what crystal-mysql could not: MySQL 8.0's
 
 ## Requirements
 
-iyi 0.21.0 or later, and iyi-db 0.5.0 (required by this package's `iyi.mod`).
+iyi 0.22.0 or later, and iyi-db 0.6.0 (required by this package's `iyi.mod`).
+0.22.0 writes `iyi.sum` lines as `h2:`, which 0.21.0 does not read.
 0.21.0 refuses raw memory in a module that does not say it handles some
 (SPEC.md III.13), and a module says so with `@[Unsafe("why")]` above its
 `module` header, which 0.20.x refuses.
@@ -235,7 +236,7 @@ range) and `UUIDValue` (its 16 bytes). Another value is refused with a
 ## Development
 
 ```sh
-DATABASE_URL=mysql://root:password@127.0.0.1?ssl-mode=disabled iyi test mysql
+DATABASE_URL=mysql://root:password@127.0.0.1?ssl-mode=disabled iyi test -p 1 mysql
 ```
 
 The tests are crystal-mysql's specs, ported, beside the modules they test, with
@@ -244,7 +245,8 @@ this port adds: the authentication plugins (`mysql/auth_test.iyi`), the types
 (`mysql/types_test.iyi`), packets across frames (`mysql/protocol_test.iyi`) and
 TLS (`mysql/ssl_test.iyi`). They read `DATABASE_URL`, `mysql://root@localhost`
 by default, whose user creates and drops the database `crystal_mysql_test` and
-test users. The TLS tests, and the driver's "connect with ssl", run when
+test users, so the files run one at a time (`-p 1`). The TLS tests, and the
+driver's "connect with ssl", run when
 `SSL_CA` names the CA of a server certificate for the test host, and the client
 certificate test when `SSL_CLIENT_CERT` and `SSL_CLIENT_KEY` name a
 certificate for `CN=iyi_client` and its key; `.github/workflows/ci.yml` makes
@@ -252,7 +254,7 @@ them. Run the suite over TLS:
 
 ```sh
 export DATABASE_URL="mysql://root:password@127.0.0.1?ssl-mode=verify_identity&ssl-ca=$SSL_CA"
-iyi test mysql
+iyi test -p 1 mysql
 ```
 
 ## Contributors

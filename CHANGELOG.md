@@ -1,10 +1,20 @@
 ## Unreleased
 
+Requires iyi 0.22.0 and iyi-db 0.6.0. 0.22.0 writes `iyi.sum` lines as
+`h2:`, a SHA-256 that says where each file ends, which 0.21.0 does not
+read, and iyi-db 0.6.0 requires 0.22.0. The driver's source is unchanged.
+
+* `iyi.sum` records iyi-db 0.6.0 in the `h2:` form.
+* CI runs on iyi 0.22.0, whose `iyi test` runs several test files at
+  once: the tests run one file at a time (`-p 1`), since they share one
+  server and `driver_test` creates and drops a database, and the modules
+  are fetched before the tests are built
+  ([iyi#246](https://github.com/iyilang/iyi/issues/246)).
 * The note that a debug build's TLS handshake overruns a task's stack in
   iyi 0.18.0 is gone from the README, and CI runs the TLS tests with
   `iyi test` in debug builds instead of one `--release` build per test:
   [iyi#130](https://github.com/iyilang/iyi/issues/130) has been fixed
-  since 2026-10-22, before the iyi 0.21.0 this driver requires.
+  since 2026-10-22, before iyi 0.21.0.
 
 ## v0.2.0
 
