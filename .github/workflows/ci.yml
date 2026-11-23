@@ -33,12 +33,21 @@ jobs:
 
       - run: iyi version
 
+      # iyi 0.22.0's `iyi test` builds several tests at once, and in a cold
+      # module cache they race fetching iyi-db (iyilang/iyi#246): fetch it
+      # first, which also checks that iyi.mod and iyi.sum are tidy.
+      - name: Fetch modules
+        run: iyi mod tidy --check
+
       # Without TLS: `ssl-mode=preferred` would try a handshake against the
-      # server's auto-generated certificate, which names no host.
+      # server's auto-generated certificate, which names no host. One test
+      # file at a time (`-p 1`): they share the one server, and
+      # `driver_test` creates and drops a database while the driver specs
+      # write their tables.
       - name: Test
         env:
           DATABASE_URL: mysql://root:password@127.0.0.1?ssl-mode=disabled
-        run: iyi test mysql
+        run: iyi test -p 1 mysql
 
       - name: Give the server a certificate for 127.0.0.1
         run: |
@@ -82,7 +91,7 @@ jobs:
       - name: Test over TLS
         run: |
           export DATABASE_URL="mysql://root:password@127.0.0.1?ssl-mode=verify_identity&ssl-ca=$SSL_CA"
-          iyi test mysql
+          iyi test -p 1 mysql
 
       - name: Check formatting
         run: iyi fmt --check mysql.iyi mysql
